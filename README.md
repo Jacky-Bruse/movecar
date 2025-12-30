@@ -23,12 +23,15 @@
 - ✅ **免费部署** - Cloudflare Workers 免费额度完全够用
 - ✅ **无需服务器** - Serverless 架构，零运维成本
 
-## 为什么使用 Bark 推送？
+## 支持的推送渠道
 
-- 🔔 支持「紧急 / 重要 / 警告」通知级别
-- 🎵 可自定义通知音效
-- 🌙 **即使开启勿扰模式也能收到提醒**
-- 📱 安卓用户：原理相通，将 Bark 替换为安卓推送服务即可（如 Pushplus、Server酱）
+| 渠道 | 平台 | 特点 |
+|------|------|------|
+| **Bark** | iOS | 支持紧急通知级别，勿扰模式也能收到提醒 |
+| **WxPusher** | 全平台 | 通过微信推送，无需额外 App |
+| **Telegram** | 全平台 | 隐私性好，无需实名认证 |
+
+> 💡 通过环境变量 `NOTIFY_CHANNEL` 切换推送渠道
 
 ## 使用流程
 
@@ -42,7 +45,7 @@
 
 ### 车主
 
-1. 收到 Bark 推送通知
+1. 收到推送通知（Bark / 微信 / Telegram）
 2. 点击通知进入确认页面
 3. 查看请求者位置（判断是否真的在车旁）
 4. 点击确认，分享自己位置给对方
@@ -97,8 +100,62 @@
 
 1. Worker →「Settings」→「Variables and Secrets」
 2. 添加以下变量：
-   - `BARK_URL`：你的 Bark 推送地址（如 `https://api.day.app/xxxxx`）
-   - `PHONE_NUMBER`：备用联系电话（可选）
+
+**必填 - 选择推送渠道：**
+
+| 变量名 | 说明 | 示例值 |
+|--------|------|--------|
+| `NOTIFY_CHANNEL` | 推送渠道（支持多个，逗号分隔） | `wxpusher,telegram` |
+| `PHONE_NUMBER` | 备用联系电话（可选） | `13800138000` |
+
+> 💡 多渠道示例：`bark,wxpusher` 会同时推送到 Bark 和微信
+
+**Bark 推送（iOS）：**
+
+| 变量名 | 说明 | 示例值 |
+|--------|------|--------|
+| `BARK_URL` | Bark 推送地址 | `https://api.day.app/xxxxx` |
+
+**WxPusher 推送（微信）：**
+
+| 变量名 | 说明 | 示例值 |
+|--------|------|--------|
+| `WXPUSHER_TOKEN` | 应用的 appToken | `AT_xxxxx` |
+| `WXPUSHER_UID` | 你的用户 UID | `UID_xxxxx` |
+
+**Telegram 推送：**
+
+| 变量名 | 说明 | 示例值 |
+|--------|------|--------|
+| `TELEGRAM_BOT_TOKEN` | Bot Token | `123456:ABC-xxxxx` |
+| `TELEGRAM_CHAT_ID` | 你的 Chat ID | `123456789` |
+
+---
+
+### 推送渠道配置教程
+
+#### Bark（iOS）
+
+1. App Store 下载 [Bark](https://apps.apple.com/app/bark-customed-notifications/id1403753865)
+2. 打开 App，复制推送地址
+3. 将地址填入 `BARK_URL`
+
+#### WxPusher（微信）
+
+1. 访问 [WxPusher 管理后台](https://wxpusher.zjiecode.com/admin)
+2. 微信扫码登录
+3. 点击「应用管理」→「新建应用」
+4. 创建后获取 `appToken`（即 `WXPUSHER_TOKEN`）
+5. 在应用详情页找到「应用二维码」，微信扫码关注
+6. 回到「用户管理」，找到你的 `UID`（即 `WXPUSHER_UID`）
+
+#### Telegram Bot
+
+1. 在 Telegram 搜索 [@BotFather](https://t.me/BotFather)
+2. 发送 `/newbot`，按提示创建 Bot
+3. 创建成功后获取 Token（即 `TELEGRAM_BOT_TOKEN`）
+4. 搜索 [@userinfobot](https://t.me/userinfobot)，发送任意消息获取你的 Chat ID（即 `TELEGRAM_CHAT_ID`）
+5. **重要**：先给你的 Bot 发一条消息激活对话，否则无法收到推送
 
 ### 第五步：绑定域名（可选）
 

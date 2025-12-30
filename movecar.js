@@ -84,6 +84,88 @@ function generateMapUrls(lat, lng) {
   };
 }
 
+// 多渠道推送通知（支持逗号分隔配置多个渠道）
+async function sendNotification(channelConfig, content, confirmUrl) {
+  const channels = channelConfig.split(',').map(c => c.trim().toLowerCase()).filter(c => c);
+
+  if (channels.length === 0) {
+    channels.push('bark'); // 默认使用 bark
+  }
+
+  const results = await Promise.allSettled(
+    channels.map(channel => {
+      switch (channel) {
+        case 'wxpusher':
+          return sendWxPusher(content, confirmUrl);
+        case 'telegram':
+          return sendTelegram(content, confirmUrl);
+        case 'bark':
+          return sendBark(content, confirmUrl);
+        default:
+          return Promise.reject(new Error(`Unknown channel: ${channel}`));
+      }
+    })
+  );
+
+  // 检查是否至少有一个成功
+  const hasSuccess = results.some(r => r.status === 'fulfilled');
+  if (!hasSuccess) {
+    const errors = results.map(r => r.reason?.message || 'Unknown error').join('; ');
+    throw new Error(`All channels failed: ${errors}`);
+  }
+
+  return results;
+}
+
+// Bark 推送 (iOS)
+async function sendBark(content, confirmUrl) {
+  const barkApiUrl = `${BARK_URL}/挪车请求/${encodeURIComponent(content)}?group=MoveCar&level=critical&call=1&sound=minuet&icon=https://cdn-icons-png.flaticon.com/512/741/741407.png&url=${confirmUrl}`;
+  const response = await fetch(barkApiUrl);
+  if (!response.ok) throw new Error('Bark API Error');
+  return response;
+}
+
+// WxPusher 推送 (微信)
+async function sendWxPusher(content, confirmUrl) {
+  const message = content.replace(/\\n/g, '\n') + `\n\n👉 点击确认: ${decodeURIComponent(confirmUrl)}`;
+
+  const response = await fetch('https://wxpusher.zjiecode.com/api/send/message', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      appToken: WXPUSHER_TOKEN,
+      content: message,
+      summary: '🚗 挪车请求',
+      contentType: 1,  // 1=文本
+      uids: [WXPUSHER_UID]
+    })
+  });
+
+  const result = await response.json();
+  if (result.code !== 1000) throw new Error('WxPusher API Error: ' + result.msg);
+  return response;
+}
+
+// Telegram Bot 推送
+async function sendTelegram(content, confirmUrl) {
+  const message = content.replace(/\\n/g, '\n') + `\n\n👉 [点击确认挪车](${decodeURIComponent(confirmUrl)})`;
+
+  const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: TELEGRAM_CHAT_ID,
+      text: message,
+      parse_mode: 'Markdown',
+      disable_web_page_preview: false
+    })
+  });
+
+  const result = await response.json();
+  if (!result.ok) throw new Error('Telegram API Error: ' + result.description);
+  return response;
+}
+
 async function handleNotify(request, url) {
   try {
     const body = await request.json();
@@ -116,10 +198,9 @@ async function handleNotify(request, url) {
       await new Promise(resolve => setTimeout(resolve, 30000));
     }
 
-    const barkApiUrl = `${BARK_URL}/挪车请求/${encodeURIComponent(notifyBody)}?group=MoveCar&level=critical&call=1&sound=minuet&icon=https://cdn-icons-png.flaticon.com/512/741/741407.png&url=${confirmUrl}`;
-
-    const barkResponse = await fetch(barkApiUrl);
-    if (!barkResponse.ok) throw new Error('Bark API Error');
+    // 根据配置的渠道发送通知
+    const channel = typeof NOTIFY_CHANNEL !== 'undefined' ? NOTIFY_CHANNEL : 'bark';
+    await sendNotification(channel, notifyBody, confirmUrl);
 
     return new Response(JSON.stringify({ success: true }), {
       headers: { 'Content-Type': 'application/json' }
