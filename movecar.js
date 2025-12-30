@@ -171,7 +171,6 @@ async function handleNotify(request, url) {
     const body = await request.json();
     const message = body.message || '车旁有人等待';
     const location = body.location || null;
-    const delayed = body.delayed || false;
 
     const confirmUrl = encodeURIComponent(url.origin + '/owner-confirm');
 
@@ -192,11 +191,6 @@ async function handleNotify(request, url) {
     }
 
     await MOVE_CAR_STATUS.put('notify_status', 'waiting', { expirationTtl: 600 });
-
-    // 如果是延迟发送，等待30秒
-    if (delayed) {
-      await new Promise(resolve => setTimeout(resolve, 30000));
-    }
 
     // 根据配置的渠道发送通知
     const channel = typeof NOTIFY_CHANNEL !== 'undefined' ? NOTIFY_CHANNEL : 'bark';
@@ -846,21 +840,35 @@ function renderMainPage(origin) {
         const delayed = !userLocation; // 无位置则延迟
 
         btn.disabled = true;
+
+        // 如果无位置，前端延迟30秒再发送
+        if (delayed) {
+          btn.innerHTML = '<span>⏳</span><span>30秒后发送...</span>';
+          showToast('⏳ 未获取位置，将延迟30秒发送');
+
+          let countdown = 30;
+          const countdownTimer = setInterval(() => {
+            countdown--;
+            if (countdown > 0) {
+              btn.innerHTML = '<span>⏳</span><span>' + countdown + '秒后发送...</span>';
+            }
+          }, 1000);
+
+          await new Promise(resolve => setTimeout(resolve, 30000));
+          clearInterval(countdownTimer);
+        }
+
         btn.innerHTML = '<span>🚀</span><span>发送中...</span>';
 
         try {
           const res = await fetch('/api/notify', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ message: msg, location: userLocation, delayed: delayed })
+            body: JSON.stringify({ message: msg, location: userLocation })
           });
 
           if (res.ok) {
-            if (delayed) {
-              showToast('⏳ 通知将延迟30秒发送');
-            } else {
-              showToast('✅ 发送成功！');
-            }
+            showToast('✅ 发送成功！');
             document.getElementById('mainView').style.display = 'none';
             document.getElementById('successView').style.display = 'flex';
             startPolling();
