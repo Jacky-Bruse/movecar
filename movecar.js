@@ -159,7 +159,14 @@ async function sendWxPusher(content, confirmUrl) {
 
 // Telegram Bot 推送
 async function sendTelegram(content, confirmUrl) {
-  const message = content.replace(/\\n/g, '\n') + `\n\n👉 [点击确认挪车](${decodeURIComponent(confirmUrl)})`;
+  // 转义 Markdown 特殊字符，避免用户留言导致解析错误
+  const escapeMarkdown = (text) => {
+    return text.replace(/([_*`\[])/g, '\\$1');
+  };
+
+  const escapedContent = escapeMarkdown(content.replace(/\\n/g, '\n'));
+  const jumpUrl = decodeURIComponent(confirmUrl);
+  const message = `${escapedContent}\n\n👉 [点击确认挪车](${jumpUrl})`;
 
   const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: 'POST',
@@ -795,6 +802,37 @@ function renderMainPage(origin) {
     <script>
       let userLocation = null;
       let checkTimer = null;
+      let timeTimer = null;
+      let waitingStartTime = null;
+
+      // 更新等待时间显示
+      function updateWaitingTime() {
+        if (!waitingStartTime) return;
+        const elapsed = Math.floor((Date.now() - waitingStartTime) / 1000);
+        const minutes = Math.floor(elapsed / 60);
+        const seconds = elapsed % 60;
+        const timeStr = minutes > 0 ? minutes + '分' + seconds + '秒' : seconds + '秒';
+        const waitingText = document.getElementById('waitingText');
+        if (waitingText && !waitingText.dataset.confirmed) {
+          waitingText.innerText = '正在等待车主回应... (' + timeStr + ')';
+        }
+      }
+
+      // 启动/重置等待计时器
+      function startWaitingTimer() {
+        if (timeTimer) clearInterval(timeTimer);
+        waitingStartTime = Date.now();
+        updateWaitingTime();
+        timeTimer = setInterval(updateWaitingTime, 1000);
+      }
+
+      // 停止等待计时器
+      function stopWaitingTimer() {
+        if (timeTimer) {
+          clearInterval(timeTimer);
+          timeTimer = null;
+        }
+      }
 
       // 页面加载时显示提示弹窗
       window.onload = () => {
@@ -895,28 +933,15 @@ function renderMainPage(origin) {
 
       function startPolling() {
         let count = 0;
-        const startTime = Date.now();
 
-        // 更新等待时间显示
-        const updateWaitingTime = () => {
-          const elapsed = Math.floor((Date.now() - startTime) / 1000);
-          const minutes = Math.floor(elapsed / 60);
-          const seconds = elapsed % 60;
-          const timeStr = minutes > 0 ? minutes + '分' + seconds + '秒' : seconds + '秒';
-          const waitingText = document.getElementById('waitingText');
-          if (waitingText && !waitingText.dataset.confirmed) {
-            waitingText.innerText = '正在等待车主回应... (' + timeStr + ')';
-          }
-        };
-
-        // 每秒更新等待时间
-        const timeTimer = setInterval(updateWaitingTime, 1000);
+        // 启动等待计时器
+        startWaitingTimer();
 
         checkTimer = setInterval(async () => {
           count++;
           if (count > 120) {
             clearInterval(checkTimer);
-            clearInterval(timeTimer);
+            stopWaitingTimer();
             return;
           }
           try {
@@ -927,6 +952,7 @@ function renderMainPage(origin) {
               fb.classList.remove('hidden');
 
               // 标记已确认，停止更新等待时间
+              stopWaitingTimer();
               const waitingText = document.getElementById('waitingText');
               waitingText.dataset.confirmed = 'true';
               waitingText.innerText = '车主已确认！';
@@ -939,7 +965,6 @@ function renderMainPage(origin) {
               }
 
               clearInterval(checkTimer);
-              clearInterval(timeTimer);
               if(navigator.vibrate) navigator.vibrate([200, 100, 200]);
             }
           } catch(e) {}
@@ -966,12 +991,13 @@ function renderMainPage(origin) {
           });
 
           if (res.ok) {
+            // 重置等待计时器
+            startWaitingTimer();
             if (userLocation) {
               showToast('✅ 再次通知已发送（含位置）');
             } else {
               showToast('✅ 再次通知已发送');
             }
-            document.getElementById('waitingText').innerText = '已再次通知，等待车主回应...';
           } else {
             throw new Error('API Error');
           }
