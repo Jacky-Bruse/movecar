@@ -578,6 +578,11 @@ function renderMainPage(origin) {
         box-shadow: 0 8px 24px rgba(239, 68, 68, 0.3);
       }
       .btn-phone:active { transform: scale(0.98); }
+      .btn-phone.disabled {
+        background: linear-gradient(135deg, #9ca3af 0%, #6b7280 100%);
+        box-shadow: none;
+        pointer-events: none;
+      }
 
       @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
       .loading-text { animation: pulse 1.5s ease-in-out infinite; }
@@ -792,9 +797,9 @@ function renderMainPage(origin) {
           <span>🔔</span>
           <span>再次通知</span>
         </button>
-        <a href="tel:${phone}" class="btn-phone">
+        <a id="phoneBtn" href="tel:${phone}" class="btn-phone disabled">
           <span>📞</span>
-          <span>直接打电话</span>
+          <span id="phoneBtnText">2分59秒后可拨打</span>
         </a>
       </div>
     </div>
@@ -802,35 +807,57 @@ function renderMainPage(origin) {
     <script>
       let userLocation = null;
       let checkTimer = null;
-      let timeTimer = null;
-      let waitingStartTime = null;
+      let phoneTimer = null;
+      let phoneCountdown = 180; // 3分钟倒计时
 
-      // 更新等待时间显示
-      function updateWaitingTime() {
-        if (!waitingStartTime) return;
-        const elapsed = Math.floor((Date.now() - waitingStartTime) / 1000);
-        const minutes = Math.floor(elapsed / 60);
-        const seconds = elapsed % 60;
-        const timeStr = minutes > 0 ? minutes + '分' + seconds + '秒' : seconds + '秒';
-        const waitingText = document.getElementById('waitingText');
-        if (waitingText && !waitingText.dataset.confirmed) {
-          waitingText.innerText = '正在等待车主回应... (' + timeStr + ')';
+      // 更新电话按钮倒计时显示
+      function updatePhoneCountdown() {
+        const phoneBtn = document.getElementById('phoneBtn');
+        const phoneBtnText = document.getElementById('phoneBtnText');
+        if (!phoneBtn || !phoneBtnText) return;
+
+        if (phoneCountdown <= 0) {
+          // 倒计时结束，激活按钮
+          phoneBtn.classList.remove('disabled');
+          phoneBtnText.innerText = '直接打电话';
+          stopPhoneTimer();
+        } else {
+          // 显示倒计时
+          const minutes = Math.floor(phoneCountdown / 60);
+          const seconds = phoneCountdown % 60;
+          const timeStr = minutes > 0 ? minutes + '分' + seconds + '秒' : seconds + '秒';
+          phoneBtnText.innerText = timeStr + '后可拨打';
+          phoneCountdown--;
         }
       }
 
-      // 启动/重置等待计时器
-      function startWaitingTimer() {
-        if (timeTimer) clearInterval(timeTimer);
-        waitingStartTime = Date.now();
-        updateWaitingTime();
-        timeTimer = setInterval(updateWaitingTime, 1000);
+      // 启动电话按钮倒计时
+      function startPhoneTimer() {
+        if (phoneTimer) clearInterval(phoneTimer);
+        phoneCountdown = 180; // 重置为3分钟
+        const phoneBtn = document.getElementById('phoneBtn');
+        if (phoneBtn) {
+          phoneBtn.classList.add('disabled');
+          phoneBtn.style.display = ''; // 确保显示
+        }
+        updatePhoneCountdown();
+        phoneTimer = setInterval(updatePhoneCountdown, 1000);
       }
 
-      // 停止等待计时器
-      function stopWaitingTimer() {
-        if (timeTimer) {
-          clearInterval(timeTimer);
-          timeTimer = null;
+      // 停止电话按钮倒计时
+      function stopPhoneTimer() {
+        if (phoneTimer) {
+          clearInterval(phoneTimer);
+          phoneTimer = null;
+        }
+      }
+
+      // 隐藏电话按钮（车主确认后调用）
+      function hidePhoneBtn() {
+        stopPhoneTimer();
+        const phoneBtn = document.getElementById('phoneBtn');
+        if (phoneBtn) {
+          phoneBtn.style.display = 'none';
         }
       }
 
@@ -934,14 +961,13 @@ function renderMainPage(origin) {
       function startPolling() {
         let count = 0;
 
-        // 启动等待计时器
-        startWaitingTimer();
+        // 启动电话按钮倒计时
+        startPhoneTimer();
 
         checkTimer = setInterval(async () => {
           count++;
           if (count > 120) {
             clearInterval(checkTimer);
-            stopWaitingTimer();
             return;
           }
           try {
@@ -951,8 +977,8 @@ function renderMainPage(origin) {
               const fb = document.getElementById('ownerFeedback');
               fb.classList.remove('hidden');
 
-              // 标记已确认，停止更新等待时间
-              stopWaitingTimer();
+              // 标记已确认，隐藏电话按钮
+              hidePhoneBtn();
               const waitingText = document.getElementById('waitingText');
               waitingText.dataset.confirmed = 'true';
               waitingText.innerText = '车主已确认！';
@@ -991,8 +1017,8 @@ function renderMainPage(origin) {
           });
 
           if (res.ok) {
-            // 重置等待计时器
-            startWaitingTimer();
+            // 重置电话按钮倒计时
+            startPhoneTimer();
             if (userLocation) {
               showToast('✅ 再次通知已发送（含位置）');
             } else {
