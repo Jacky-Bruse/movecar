@@ -96,13 +96,22 @@ async function sendNotification(channelConfig, content, confirmUrl) {
     channels.map(channel => {
       switch (channel) {
         case 'wxpusher':
+          if (typeof WXPUSHER_TOKEN === 'undefined' || typeof WXPUSHER_UID === 'undefined') {
+            return Promise.reject(new Error('WxPusher 未配置: 请设置 WXPUSHER_TOKEN 和 WXPUSHER_UID'));
+          }
           return sendWxPusher(content, confirmUrl);
         case 'telegram':
+          if (typeof TELEGRAM_BOT_TOKEN === 'undefined' || typeof TELEGRAM_CHAT_ID === 'undefined') {
+            return Promise.reject(new Error('Telegram 未配置: 请设置 TELEGRAM_BOT_TOKEN 和 TELEGRAM_CHAT_ID'));
+          }
           return sendTelegram(content, confirmUrl);
         case 'bark':
+          if (typeof BARK_URL === 'undefined') {
+            return Promise.reject(new Error('Bark 未配置: 请设置 BARK_URL'));
+          }
           return sendBark(content, confirmUrl);
         default:
-          return Promise.reject(new Error(`Unknown channel: ${channel}`));
+          return Promise.reject(new Error(`未知渠道: ${channel}`));
       }
     })
   );
@@ -111,7 +120,7 @@ async function sendNotification(channelConfig, content, confirmUrl) {
   const hasSuccess = results.some(r => r.status === 'fulfilled');
   if (!hasSuccess) {
     const errors = results.map(r => r.reason?.message || 'Unknown error').join('; ');
-    throw new Error(`All channels failed: ${errors}`);
+    throw new Error(`所有渠道推送失败: ${errors}`);
   }
 
   return results;
@@ -127,7 +136,8 @@ async function sendBark(content, confirmUrl) {
 
 // WxPusher 推送 (微信)
 async function sendWxPusher(content, confirmUrl) {
-  const message = content.replace(/\\n/g, '\n') + `\n\n👉 点击确认: ${decodeURIComponent(confirmUrl)}`;
+  const message = content.replace(/\\n/g, '\n');
+  const jumpUrl = decodeURIComponent(confirmUrl);
 
   const response = await fetch('https://wxpusher.zjiecode.com/api/send/message', {
     method: 'POST',
@@ -137,7 +147,8 @@ async function sendWxPusher(content, confirmUrl) {
       content: message,
       summary: '🚗 挪车请求',
       contentType: 1,  // 1=文本
-      uids: [WXPUSHER_UID]
+      uids: [WXPUSHER_UID],
+      url: jumpUrl  // 点击消息直接跳转确认页面
     })
   });
 
@@ -884,15 +895,42 @@ function renderMainPage(origin) {
 
       function startPolling() {
         let count = 0;
+        const startTime = Date.now();
+
+        // 更新等待时间显示
+        const updateWaitingTime = () => {
+          const elapsed = Math.floor((Date.now() - startTime) / 1000);
+          const minutes = Math.floor(elapsed / 60);
+          const seconds = elapsed % 60;
+          const timeStr = minutes > 0 ? minutes + '分' + seconds + '秒' : seconds + '秒';
+          const waitingText = document.getElementById('waitingText');
+          if (waitingText && !waitingText.dataset.confirmed) {
+            waitingText.innerText = '正在等待车主回应... (' + timeStr + ')';
+          }
+        };
+
+        // 每秒更新等待时间
+        const timeTimer = setInterval(updateWaitingTime, 1000);
+
         checkTimer = setInterval(async () => {
           count++;
-          if (count > 120) { clearInterval(checkTimer); return; }
+          if (count > 120) {
+            clearInterval(checkTimer);
+            clearInterval(timeTimer);
+            return;
+          }
           try {
             const res = await fetch('/api/check-status');
             const data = await res.json();
             if (data.status === 'confirmed') {
               const fb = document.getElementById('ownerFeedback');
               fb.classList.remove('hidden');
+
+              // 标记已确认，停止更新等待时间
+              const waitingText = document.getElementById('waitingText');
+              waitingText.dataset.confirmed = 'true';
+              waitingText.innerText = '车主已确认！';
+              waitingText.classList.remove('loading-text');
 
               if (data.ownerLocation && data.ownerLocation.amapUrl) {
                 document.getElementById('ownerMapLinks').style.display = 'flex';
@@ -901,6 +939,7 @@ function renderMainPage(origin) {
               }
 
               clearInterval(checkTimer);
+              clearInterval(timeTimer);
               if(navigator.vibrate) navigator.vibrate([200, 100, 200]);
             }
           } catch(e) {}
@@ -927,7 +966,11 @@ function renderMainPage(origin) {
           });
 
           if (res.ok) {
-            showToast('✅ 再次通知已发送！');
+            if (userLocation) {
+              showToast('✅ 再次通知已发送（含位置）');
+            } else {
+              showToast('✅ 再次通知已发送');
+            }
             document.getElementById('waitingText').innerText = '已再次通知，等待车主回应...';
           } else {
             throw new Error('API Error');
