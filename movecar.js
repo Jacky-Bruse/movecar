@@ -791,7 +791,7 @@ function renderMainPage(origin) {
         </div>
       </div>
 
-      <div class="card action-card">
+      <div id="actionCard" class="card action-card">
         <p class="action-hint">车主没反应？试试其他方式</p>
         <button id="retryBtn" class="btn-retry" onclick="retryNotify()">
           <span>🔔</span>
@@ -852,12 +852,12 @@ function renderMainPage(origin) {
         }
       }
 
-      // 隐藏电话按钮（车主确认后调用）
-      function hidePhoneBtn() {
+      // 隐藏操作卡片（车主确认后调用）
+      function hideActionCard() {
         stopPhoneTimer();
-        const phoneBtn = document.getElementById('phoneBtn');
-        if (phoneBtn) {
-          phoneBtn.style.display = 'none';
+        const actionCard = document.getElementById('actionCard');
+        if (actionCard) {
+          actionCard.style.display = 'none';
         }
       }
 
@@ -977,8 +977,8 @@ function renderMainPage(origin) {
               const fb = document.getElementById('ownerFeedback');
               fb.classList.remove('hidden');
 
-              // 标记已确认，隐藏电话按钮
-              hidePhoneBtn();
+              // 标记已确认，隐藏操作卡片
+              hideActionCard();
               const waitingText = document.getElementById('waitingText');
               waitingText.dataset.confirmed = 'true';
               waitingText.innerText = '车主已确认！';
