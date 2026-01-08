@@ -24,12 +24,25 @@ async function handleRequest(request) {
     const status = await MOVE_CAR_STATUS.get('notify_status');
     const ownerLocation = await MOVE_CAR_STATUS.get('owner_location');
     const error = await MOVE_CAR_STATUS.get('notify_error');
+
+    let parsedOwnerLocation = null;
+    if (ownerLocation) {
+      try {
+        parsedOwnerLocation = JSON.parse(ownerLocation);
+      } catch (e) {
+        parsedOwnerLocation = null;
+      }
+    }
+
     return new Response(JSON.stringify({
       status: status || 'waiting',
-      ownerLocation: ownerLocation ? JSON.parse(ownerLocation) : null,
+      ownerLocation: parsedOwnerLocation,
       error: error || null
     }), {
-      headers: { 'Content-Type': 'application/json' }
+      headers: {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-store'
+      }
     });
   }
 
@@ -225,16 +238,33 @@ async function handleNotify(request, url) {
       headers: { 'Content-Type': 'application/json' }
     });
   } catch (error) {
-    return new Response(JSON.stringify({ success: false, error: error.message }), { status: 500 });
+    const errorMessage = (error && error.message) ? error.message : 'Unknown error';
+    await MOVE_CAR_STATUS.put('notify_status', 'error', { expirationTtl: CONFIG.KV_TTL }).catch(() => {});
+    await MOVE_CAR_STATUS.put('notify_error', errorMessage, { expirationTtl: CONFIG.KV_TTL }).catch(() => {});
+    return new Response(JSON.stringify({ success: false, error: errorMessage }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
   }
 }
 
 async function handleGetLocation() {
   const data = await MOVE_CAR_STATUS.get('requester_location');
   if (data) {
-    return new Response(data, { headers: { 'Content-Type': 'application/json' } });
+    return new Response(data, {
+      headers: {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-store'
+      }
+    });
   }
-  return new Response(JSON.stringify({ error: 'No location' }), { status: 404 });
+  return new Response(JSON.stringify({ error: 'No location' }), {
+    status: 404,
+    headers: {
+      'Content-Type': 'application/json',
+      'Cache-Control': 'no-store'
+    }
+  });
 }
 
 async function handleOwnerConfirmAction(request) {
@@ -1313,6 +1343,8 @@ function renderOwnerPage() {
         <span>我已知晓，正在前往</span>
       </button>
 
+      <div id="statusMsg" class="loc-status"></div>
+
       <div id="doneMsg" class="done-msg">
         <p>✅ 已通知对方您正在赶来！</p>
       </div>
@@ -1363,16 +1395,44 @@ function renderOwnerPage() {
       }
 
       // 发送确认
+      function updateStatus(text, type) {
+        const status = document.getElementById('statusMsg');
+        if (!status) return;
+        if (!text) {
+          status.textContent = '';
+          status.className = 'loc-status';
+          return;
+        }
+        status.textContent = text;
+        status.className = 'loc-status show' + (type ? ' ' + type : '');
+      }
+
       async function doConfirm() {
         const btn = document.getElementById('confirmBtn');
         btn.innerHTML = '<span>⏳</span><span>确认中...</span>';
+        updateStatus('');
 
         try {
-          await fetch('/api/owner-confirm', {
+          const res = await fetch('/api/owner-confirm', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ location: ownerLocation })
           });
+
+          let data = null;
+          try {
+            data = await res.json();
+          } catch (_) {
+            data = null;
+          }
+
+          if (!res.ok) {
+            throw new Error((data && data.error) ? data.error : '服务器响应错误');
+          }
+
+          if (!data || !data.success) {
+            throw new Error((data && data.error) ? data.error : '确认失败');
+          }
 
           btn.innerHTML = '<span>✅</span><span>已确认</span>';
           btn.style.background = 'linear-gradient(135deg, #9ca3af 0%, #6b7280 100%)';
@@ -1380,6 +1440,7 @@ function renderOwnerPage() {
         } catch(e) {
           btn.disabled = false;
           btn.innerHTML = '<span>🚀</span><span>我已知晓，正在前往</span>';
+          updateStatus('确认失败，请重试：' + ((e && e.message) ? e.message : '未知错误'), 'error');
         }
       }
     </script>
