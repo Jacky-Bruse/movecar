@@ -23,9 +23,11 @@ async function handleRequest(request) {
   if (path === '/api/check-status') {
     const status = await MOVE_CAR_STATUS.get('notify_status');
     const ownerLocation = await MOVE_CAR_STATUS.get('owner_location');
+    const error = await MOVE_CAR_STATUS.get('notify_error');
     return new Response(JSON.stringify({
       status: status || 'waiting',
-      ownerLocation: ownerLocation ? JSON.parse(ownerLocation) : null
+      ownerLocation: ownerLocation ? JSON.parse(ownerLocation) : null,
+      error: error || null
     }), {
       headers: { 'Content-Type': 'application/json' }
     });
@@ -80,7 +82,7 @@ function generateMapUrls(lat, lng) {
   const gcj = wgs84ToGcj02(lat, lng);
   return {
     amapUrl: `https://uri.amap.com/marker?position=${gcj.lng},${gcj.lat}&name=位置`,
-    appleUrl: `https://maps.apple.com/?ll=${gcj.lat},${gcj.lng}&q=位置`
+    appleUrl: `https://maps.apple.com/?ll=${gcj.lat},${gcj.lng}&q=位置`  // Apple Maps（中国大陆）使用 GCJ-02 坐标
   };
 }
 
@@ -154,18 +156,22 @@ async function sendWxPusher(content, confirmUrl) {
 
   const result = await response.json();
   if (result.code !== 1000) throw new Error('WxPusher API Error: ' + result.msg);
-  return response;
+  return result;
 }
 
 // Telegram Bot 推送
 async function sendTelegram(content, confirmUrl) {
-  // 转义 Markdown 特殊字符，避免用户留言导致解析错误
-  const escapeMarkdown = (text) => {
-    return text.replace(/([_*`\[])/g, '\\$1');
+  // 转义 MarkdownV2 特殊字符，避免用户留言导致解析错误
+  const escapeMarkdownV2 = (text) => {
+    return text.replace(/([_*\[\]()~`>#+=|{}.!\\-])/g, '\\$1');
   };
 
-  const escapedContent = escapeMarkdown(content.replace(/\\n/g, '\n'));
-  const jumpUrl = decodeURIComponent(confirmUrl);
+  const escapeMarkdownV2Url = (url) => {
+    return url.replace(/([\\)])/g, '\\$1');
+  };
+
+  const escapedContent = escapeMarkdownV2(content.replace(/\\n/g, '\n'));
+  const jumpUrl = escapeMarkdownV2Url(decodeURIComponent(confirmUrl));
   const message = `${escapedContent}\n\n👉 [点击确认挪车](${jumpUrl})`;
 
   const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
@@ -174,7 +180,7 @@ async function sendTelegram(content, confirmUrl) {
     body: JSON.stringify({
       chat_id: TELEGRAM_CHAT_ID,
       text: message,
-      parse_mode: 'Markdown',
+      parse_mode: 'MarkdownV2',
       disable_web_page_preview: false
     })
   });
@@ -208,7 +214,8 @@ async function handleNotify(request, url) {
       notifyBody += '\\n⚠️ 未提供位置信息';
     }
 
-    await MOVE_CAR_STATUS.put('notify_status', 'waiting', { expirationTtl: 600 });
+    await MOVE_CAR_STATUS.delete('notify_error').catch(() => {});
+    await MOVE_CAR_STATUS.put('notify_status', 'waiting', { expirationTtl: CONFIG.KV_TTL });
 
     // 根据配置的渠道发送通知
     const channel = typeof NOTIFY_CHANNEL !== 'undefined' ? NOTIFY_CHANNEL : 'bark';
@@ -235,7 +242,7 @@ async function handleOwnerConfirmAction(request) {
     const body = await request.json();
     const ownerLocation = body.location || null;
 
-    if (ownerLocation) {
+    if (ownerLocation && ownerLocation.lat && ownerLocation.lng) {
       const urls = generateMapUrls(ownerLocation.lat, ownerLocation.lng);
       await MOVE_CAR_STATUS.put('owner_location', JSON.stringify({
         lat: ownerLocation.lat,
@@ -245,13 +252,17 @@ async function handleOwnerConfirmAction(request) {
       }), { expirationTtl: CONFIG.KV_TTL });
     }
 
-    await MOVE_CAR_STATUS.put('notify_status', 'confirmed', { expirationTtl: 600 });
+    await MOVE_CAR_STATUS.delete('notify_error').catch(() => {});
+    await MOVE_CAR_STATUS.put('notify_status', 'confirmed', { expirationTtl: CONFIG.KV_TTL });
     return new Response(JSON.stringify({ success: true }), {
       headers: { 'Content-Type': 'application/json' }
     });
   } catch (error) {
-    await MOVE_CAR_STATUS.put('notify_status', 'confirmed', { expirationTtl: 600 });
-    return new Response(JSON.stringify({ success: true }), {
+    const errorMessage = (error && error.message) ? error.message : 'Unknown error';
+    await MOVE_CAR_STATUS.put('notify_status', 'error', { expirationTtl: CONFIG.KV_TTL }).catch(() => {});
+    await MOVE_CAR_STATUS.put('notify_error', errorMessage, { expirationTtl: CONFIG.KV_TTL }).catch(() => {});
+    return new Response(JSON.stringify({ success: false, error: errorMessage }), {
+      status: 500,
       headers: { 'Content-Type': 'application/json' }
     });
   }
@@ -809,6 +820,8 @@ function renderMainPage(origin) {
       let checkTimer = null;
       let phoneTimer = null;
       let phoneCountdown = 180; // 3分钟倒计时
+      let retryCountdown = 0; // 再次通知冷却倒计时
+      let retryTimer = null;
 
       // 更新电话按钮倒计时显示
       function updatePhoneCountdown() {
@@ -959,42 +972,59 @@ function renderMainPage(origin) {
       }
 
       function startPolling() {
-        let count = 0;
+        let pollCount = 0;
+        const maxPolls = 180; // 最多轮询约10分钟
 
         // 启动电话按钮倒计时
         startPhoneTimer();
 
-        checkTimer = setInterval(async () => {
-          count++;
-          if (count > 120) {
-            clearInterval(checkTimer);
-            return;
-          }
-          try {
-            const res = await fetch('/api/check-status');
-            const data = await res.json();
-            if (data.status === 'confirmed') {
-              const fb = document.getElementById('ownerFeedback');
-              fb.classList.remove('hidden');
+        function poll() {
+          pollCount++;
+          if (pollCount > maxPolls) return;
 
-              // 标记已确认，隐藏操作卡片
-              hideActionCard();
-              const waitingText = document.getElementById('waitingText');
-              waitingText.dataset.confirmed = 'true';
-              waitingText.innerText = '车主已确认！';
-              waitingText.classList.remove('loading-text');
+          fetch('/api/check-status')
+            .then(res => res.json())
+            .then(data => {
+              if (data.status === 'confirmed') {
+                const fb = document.getElementById('ownerFeedback');
+                fb.classList.remove('hidden');
 
-              if (data.ownerLocation && data.ownerLocation.amapUrl) {
-                document.getElementById('ownerMapLinks').style.display = 'flex';
-                document.getElementById('ownerAmapLink').href = data.ownerLocation.amapUrl;
-                document.getElementById('ownerAppleLink').href = data.ownerLocation.appleUrl;
+                // 标记已确认，隐藏操作卡片
+                hideActionCard();
+                const waitingText = document.getElementById('waitingText');
+                waitingText.dataset.confirmed = 'true';
+                waitingText.innerText = '车主已确认！';
+                waitingText.classList.remove('loading-text');
+
+                if (data.ownerLocation && data.ownerLocation.amapUrl) {
+                  document.getElementById('ownerMapLinks').style.display = 'flex';
+                  document.getElementById('ownerAmapLink').href = data.ownerLocation.amapUrl;
+                  document.getElementById('ownerAppleLink').href = data.ownerLocation.appleUrl;
+                }
+
+                if(navigator.vibrate) navigator.vibrate([200, 100, 200]);
+              } else if (data.status === 'error') {
+                const waitingText = document.getElementById('waitingText');
+                if (waitingText) {
+                  waitingText.dataset.confirmed = 'true';
+                  waitingText.innerText = data.error ? '车主确认失败：' + data.error : '车主确认失败，请重试。';
+                  waitingText.classList.remove('loading-text');
+                }
+                showToast('❌ 车主确认失败');
+              } else {
+                // 渐进式间隔：前1分钟每2秒，之后每5秒
+                const interval = pollCount <= 30 ? 2000 : 5000;
+                checkTimer = setTimeout(poll, interval);
               }
+            })
+            .catch(() => {
+              // 出错时继续轮询
+              const interval = pollCount <= 30 ? 2000 : 5000;
+              checkTimer = setTimeout(poll, interval);
+            });
+        }
 
-              clearInterval(checkTimer);
-              if(navigator.vibrate) navigator.vibrate([200, 100, 200]);
-            }
-          } catch(e) {}
-        }, 3000);
+        poll();
       }
 
       function showToast(text) {
@@ -1002,6 +1032,36 @@ function renderMainPage(origin) {
         t.innerText = text;
         t.classList.add('show');
         setTimeout(() => t.classList.remove('show'), 3000);
+      }
+
+      // 更新再次通知按钮冷却倒计时
+      function updateRetryCountdown() {
+        const retryBtn = document.getElementById('retryBtn');
+        if (!retryBtn) return;
+
+        if (retryCountdown <= 0) {
+          retryBtn.disabled = false;
+          retryBtn.innerHTML = '<span>🔔</span><span>再次通知</span>';
+          stopRetryTimer();
+        } else {
+          retryBtn.disabled = true;
+          retryBtn.innerHTML = '<span>⏳</span><span>' + retryCountdown + '秒后可再次通知</span>';
+          retryCountdown--;
+        }
+      }
+
+      function startRetryTimer() {
+        if (retryTimer) clearInterval(retryTimer);
+        retryCountdown = 30; // 30秒冷却
+        updateRetryCountdown();
+        retryTimer = setInterval(updateRetryCountdown, 1000);
+      }
+
+      function stopRetryTimer() {
+        if (retryTimer) {
+          clearInterval(retryTimer);
+          retryTimer = null;
+        }
       }
 
       async function retryNotify() {
@@ -1019,6 +1079,8 @@ function renderMainPage(origin) {
           if (res.ok) {
             // 重置电话按钮倒计时
             startPhoneTimer();
+            // 启动再次通知冷却倒计时
+            startRetryTimer();
             if (userLocation) {
               showToast('✅ 再次通知已发送（含位置）');
             } else {
@@ -1029,10 +1091,9 @@ function renderMainPage(origin) {
           }
         } catch (e) {
           showToast('❌ 发送失败，请重试');
+          btn.disabled = false;
+          btn.innerHTML = '<span>🔔</span><span>再次通知</span>';
         }
-
-        btn.disabled = false;
-        btn.innerHTML = '<span>🔔</span><span>再次通知</span>';
       }
     </script>
   </body>
