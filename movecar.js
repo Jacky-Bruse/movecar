@@ -2,7 +2,39 @@ addEventListener('fetch', event => {
   event.respondWith(handleRequest(event.request))
 })
 
-const CONFIG = { KV_TTL: 3600 }
+const CONFIG = {
+  KV_TTL: 3600,
+  SESSION_TTL: 1800,
+  RATE_LIMIT_TTL: 30
+}
+
+async function readStatusRecord() {
+  const rawStatus = await MOVE_CAR_STATUS.get('notify_status');
+  if (!rawStatus) return null;
+
+  try {
+    const parsed = JSON.parse(rawStatus);
+    if (parsed && typeof parsed === 'object' && parsed.status) {
+      return parsed;
+    }
+  } catch (e) {}
+
+  return {
+    status: rawStatus,
+    sessionId: null,
+    updatedAt: null
+  };
+}
+
+async function writeStatusRecord(status, sessionId) {
+  await MOVE_CAR_STATUS.put('notify_status', JSON.stringify({
+    status,
+    sessionId: sessionId || null,
+    updatedAt: Date.now()
+  }), {
+    expirationTtl: CONFIG.SESSION_TTL
+  });
+}
 
 async function handleRequest(request) {
   const url = new URL(request.url)
@@ -21,9 +53,23 @@ async function handleRequest(request) {
   }
 
   if (path === '/api/check-status') {
-    const status = await MOVE_CAR_STATUS.get('notify_status');
+    const sessionId = url.searchParams.get('s');
+    const statusRecord = await readStatusRecord();
     const ownerLocation = await MOVE_CAR_STATUS.get('owner_location');
     const error = await MOVE_CAR_STATUS.get('notify_error');
+
+    if (!statusRecord || !sessionId || statusRecord.sessionId !== sessionId) {
+      return new Response(JSON.stringify({
+        status: 'none',
+        ownerLocation: null,
+        error: null
+      }), {
+        headers: {
+          'Content-Type': 'application/json',
+          'Cache-Control': 'no-store'
+        }
+      });
+    }
 
     let parsedOwnerLocation = null;
     if (ownerLocation) {
@@ -35,7 +81,7 @@ async function handleRequest(request) {
     }
 
     return new Response(JSON.stringify({
-      status: status || 'waiting',
+      status: statusRecord.status || 'waiting',
       ownerLocation: parsedOwnerLocation,
       error: error || null
     }), {
@@ -204,8 +250,18 @@ async function sendTelegram(content, confirmUrl) {
 }
 
 async function handleNotify(request, url) {
+  const rateLimitMessage = '发送过于频繁，请30秒后再试';
   try {
+    const isLocked = await MOVE_CAR_STATUS.get('notify_lock');
+    if (isLocked) {
+      return new Response(JSON.stringify({ success: false, error: rateLimitMessage }), {
+        status: 429,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
     const body = await request.json();
+    const sessionId = body.sessionId || null;
     const message = body.message || '车旁有人等待';
     const location = body.location || null;
 
@@ -228,7 +284,8 @@ async function handleNotify(request, url) {
     }
 
     await MOVE_CAR_STATUS.delete('notify_error').catch(() => {});
-    await MOVE_CAR_STATUS.put('notify_status', 'waiting', { expirationTtl: CONFIG.KV_TTL });
+    await writeStatusRecord('waiting', sessionId);
+    await MOVE_CAR_STATUS.put('notify_lock', '1', { expirationTtl: CONFIG.RATE_LIMIT_TTL });
 
     // 根据配置的渠道发送通知
     const channel = typeof NOTIFY_CHANNEL !== 'undefined' ? NOTIFY_CHANNEL : 'bark';
@@ -239,7 +296,9 @@ async function handleNotify(request, url) {
     });
   } catch (error) {
     const errorMessage = (error && error.message) ? error.message : 'Unknown error';
-    await MOVE_CAR_STATUS.put('notify_status', 'error', { expirationTtl: CONFIG.KV_TTL }).catch(() => {});
+    const statusRecord = await readStatusRecord().catch(() => null);
+    await MOVE_CAR_STATUS.delete('notify_lock').catch(() => {});
+    await writeStatusRecord('error', statusRecord?.sessionId || null).catch(() => {});
     await MOVE_CAR_STATUS.put('notify_error', errorMessage, { expirationTtl: CONFIG.KV_TTL }).catch(() => {});
     return new Response(JSON.stringify({ success: false, error: errorMessage }), {
       status: 500,
@@ -271,6 +330,7 @@ async function handleOwnerConfirmAction(request) {
   try {
     const body = await request.json();
     const ownerLocation = body.location || null;
+    const statusRecord = await readStatusRecord();
 
     if (ownerLocation && ownerLocation.lat && ownerLocation.lng) {
       const urls = generateMapUrls(ownerLocation.lat, ownerLocation.lng);
@@ -283,13 +343,14 @@ async function handleOwnerConfirmAction(request) {
     }
 
     await MOVE_CAR_STATUS.delete('notify_error').catch(() => {});
-    await MOVE_CAR_STATUS.put('notify_status', 'confirmed', { expirationTtl: CONFIG.KV_TTL });
+    await writeStatusRecord('confirmed', statusRecord?.sessionId || null);
     return new Response(JSON.stringify({ success: true }), {
       headers: { 'Content-Type': 'application/json' }
     });
   } catch (error) {
     const errorMessage = (error && error.message) ? error.message : 'Unknown error';
-    await MOVE_CAR_STATUS.put('notify_status', 'error', { expirationTtl: CONFIG.KV_TTL }).catch(() => {});
+    const statusRecord = await readStatusRecord().catch(() => null);
+    await writeStatusRecord('error', statusRecord?.sessionId || null).catch(() => {});
     await MOVE_CAR_STATUS.put('notify_error', errorMessage, { expirationTtl: CONFIG.KV_TTL }).catch(() => {});
     return new Response(JSON.stringify({ success: false, error: errorMessage }), {
       status: 500,
@@ -849,23 +910,47 @@ function renderMainPage(origin) {
       let userLocation = null;
       let checkTimer = null;
       let phoneTimer = null;
-      let phoneCountdown = 180; // 3分钟倒计时
-      let retryCountdown = 0; // 再次通知冷却倒计时
+      let phoneCountdown = 180;
+      let retryCountdown = 0;
       let retryTimer = null;
+      const SESSION_STORAGE_KEY = 'movecar_session';
+      let sessionId = getOrCreateSessionId();
 
-      // 更新电话按钮倒计时显示
+      function getOrCreateSessionId() {
+        let stored = localStorage.getItem(SESSION_STORAGE_KEY);
+        if (!stored) {
+          stored = (window.crypto && window.crypto.randomUUID)
+            ? window.crypto.randomUUID()
+            : Date.now() + '_' + Math.random().toString(36).slice(2);
+          localStorage.setItem(SESSION_STORAGE_KEY, stored);
+        }
+        return stored;
+      }
+
+      function getStatusUrl() {
+        return '/api/check-status?s=' + encodeURIComponent(sessionId);
+      }
+
+      function showMainView() {
+        document.getElementById('mainView').style.display = 'flex';
+        document.getElementById('successView').style.display = 'none';
+      }
+
+      function showSuccessView() {
+        document.getElementById('mainView').style.display = 'none';
+        document.getElementById('successView').style.display = 'flex';
+      }
+
       function updatePhoneCountdown() {
         const phoneBtn = document.getElementById('phoneBtn');
         const phoneBtnText = document.getElementById('phoneBtnText');
         if (!phoneBtn || !phoneBtnText) return;
 
         if (phoneCountdown <= 0) {
-          // 倒计时结束，激活按钮
           phoneBtn.classList.remove('disabled');
           phoneBtnText.innerText = '直接打电话';
           stopPhoneTimer();
         } else {
-          // 显示倒计时
           const minutes = Math.floor(phoneCountdown / 60);
           const seconds = phoneCountdown % 60;
           const timeStr = minutes > 0 ? minutes + '分' + seconds + '秒' : seconds + '秒';
@@ -874,20 +959,18 @@ function renderMainPage(origin) {
         }
       }
 
-      // 启动电话按钮倒计时
       function startPhoneTimer() {
         if (phoneTimer) clearInterval(phoneTimer);
-        phoneCountdown = 180; // 重置为3分钟
+        phoneCountdown = 180;
         const phoneBtn = document.getElementById('phoneBtn');
         if (phoneBtn) {
           phoneBtn.classList.add('disabled');
-          phoneBtn.style.display = ''; // 确保显示
+          phoneBtn.style.display = '';
         }
         updatePhoneCountdown();
         phoneTimer = setInterval(updatePhoneCountdown, 1000);
       }
 
-      // 停止电话按钮倒计时
       function stopPhoneTimer() {
         if (phoneTimer) {
           clearInterval(phoneTimer);
@@ -895,7 +978,6 @@ function renderMainPage(origin) {
         }
       }
 
-      // 隐藏操作卡片（车主确认后调用）
       function hideActionCard() {
         stopPhoneTimer();
         const actionCard = document.getElementById('actionCard');
@@ -904,10 +986,21 @@ function renderMainPage(origin) {
         }
       }
 
-      // 页面加载时显示提示弹窗
-      window.onload = () => {
-        showModal('locationTipModal');
-      };
+      function resetWaitingState() {
+        const actionCard = document.getElementById('actionCard');
+        const waitingText = document.getElementById('waitingText');
+        const ownerFeedback = document.getElementById('ownerFeedback');
+        const ownerMapLinks = document.getElementById('ownerMapLinks');
+
+        if (actionCard) actionCard.style.display = '';
+        if (ownerFeedback) ownerFeedback.classList.add('hidden');
+        if (ownerMapLinks) ownerMapLinks.style.display = 'none';
+        if (waitingText) {
+          waitingText.dataset.confirmed = 'false';
+          waitingText.innerText = '正在等待车主回应...';
+          waitingText.classList.add('loading-text');
+        }
+      }
 
       function showModal(id) {
         document.getElementById(id).classList.add('show');
@@ -917,7 +1010,68 @@ function renderMainPage(origin) {
         document.getElementById(id).classList.remove('show');
       }
 
-      // 用户点击"我知道了"后请求位置
+      function applyStatus(data) {
+        if (data.status === 'confirmed') {
+          const fb = document.getElementById('ownerFeedback');
+          fb.classList.remove('hidden');
+
+          hideActionCard();
+          const waitingText = document.getElementById('waitingText');
+          waitingText.dataset.confirmed = 'true';
+          waitingText.innerText = '车主已确认！';
+          waitingText.classList.remove('loading-text');
+
+          if (data.ownerLocation && data.ownerLocation.amapUrl) {
+            document.getElementById('ownerMapLinks').style.display = 'flex';
+            document.getElementById('ownerAmapLink').href = data.ownerLocation.amapUrl;
+            document.getElementById('ownerAppleLink').href = data.ownerLocation.appleUrl;
+          }
+
+          if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
+          return;
+        }
+
+        if (data.status === 'error') {
+          const waitingText = document.getElementById('waitingText');
+          if (waitingText) {
+            waitingText.dataset.confirmed = 'true';
+            waitingText.innerText = data.error ? '车主确认失败：' + data.error : '车主确认失败，请重试。';
+            waitingText.classList.remove('loading-text');
+          }
+          showToast('❌ 车主确认失败');
+          return;
+        }
+
+        resetWaitingState();
+      }
+
+      async function restoreActiveSession() {
+        try {
+          const res = await fetch('/api/check-status?s=' + encodeURIComponent(sessionId));
+          const data = await res.json();
+          if (!data.status || data.status === 'none') {
+            localStorage.removeItem(SESSION_STORAGE_KEY);
+            sessionId = getOrCreateSessionId();
+            return false;
+          }
+
+          showSuccessView();
+          applyStatus(data);
+          startPolling();
+          return true;
+        } catch (e) {
+          return false;
+        }
+      }
+
+      window.onload = async () => {
+        const restored = await restoreActiveSession();
+        if (!restored) {
+          showMainView();
+          showModal('locationTipModal');
+        }
+      };
+
       function requestLocation() {
         const icon = document.getElementById('locIcon');
         const txt = document.getElementById('locStatus');
@@ -934,7 +1088,7 @@ function renderMainPage(origin) {
               txt.className = 'loc-status success';
               txt.innerText = '已获取位置 ✓';
             },
-            (err) => {
+            () => {
               icon.className = 'loc-icon error';
               txt.className = 'loc-status error';
               txt.innerText = '位置获取失败，刷新页面可重试';
@@ -952,15 +1106,13 @@ function renderMainPage(origin) {
         document.getElementById('msgInput').value = text;
       }
 
-      // 发送通知
       async function sendNotify() {
         const btn = document.getElementById('notifyBtn');
         const msg = document.getElementById('msgInput').value;
-        const delayed = !userLocation; // 无位置则延迟
+        const delayed = !userLocation;
 
         btn.disabled = true;
 
-        // 如果无位置，前端延迟30秒再发送
         if (delayed) {
           btn.innerHTML = '<span>⏳</span><span>30秒后发送...</span>';
           showToast('⏳ 未获取位置，将延迟30秒发送');
@@ -983,13 +1135,13 @@ function renderMainPage(origin) {
           const res = await fetch('/api/notify', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ message: msg, location: userLocation })
+            body: JSON.stringify({ message: msg, location: userLocation, sessionId: sessionId })
           });
 
           if (res.ok) {
             showToast('✅ 发送成功！');
-            document.getElementById('mainView').style.display = 'none';
-            document.getElementById('successView').style.display = 'flex';
+            showSuccessView();
+            resetWaitingState();
             startPolling();
           } else {
             throw new Error('API Error');
@@ -1003,52 +1155,27 @@ function renderMainPage(origin) {
 
       function startPolling() {
         let pollCount = 0;
-        const maxPolls = 180; // 最多轮询约10分钟
+        const maxPolls = 180;
+        if (checkTimer) clearTimeout(checkTimer);
 
-        // 启动电话按钮倒计时
         startPhoneTimer();
 
         function poll() {
           pollCount++;
           if (pollCount > maxPolls) return;
 
-          fetch('/api/check-status')
+          fetch(getStatusUrl())
             .then(res => res.json())
             .then(data => {
-              if (data.status === 'confirmed') {
-                const fb = document.getElementById('ownerFeedback');
-                fb.classList.remove('hidden');
+              if (data.status === 'none') return;
 
-                // 标记已确认，隐藏操作卡片
-                hideActionCard();
-                const waitingText = document.getElementById('waitingText');
-                waitingText.dataset.confirmed = 'true';
-                waitingText.innerText = '车主已确认！';
-                waitingText.classList.remove('loading-text');
-
-                if (data.ownerLocation && data.ownerLocation.amapUrl) {
-                  document.getElementById('ownerMapLinks').style.display = 'flex';
-                  document.getElementById('ownerAmapLink').href = data.ownerLocation.amapUrl;
-                  document.getElementById('ownerAppleLink').href = data.ownerLocation.appleUrl;
-                }
-
-                if(navigator.vibrate) navigator.vibrate([200, 100, 200]);
-              } else if (data.status === 'error') {
-                const waitingText = document.getElementById('waitingText');
-                if (waitingText) {
-                  waitingText.dataset.confirmed = 'true';
-                  waitingText.innerText = data.error ? '车主确认失败：' + data.error : '车主确认失败，请重试。';
-                  waitingText.classList.remove('loading-text');
-                }
-                showToast('❌ 车主确认失败');
-              } else {
-                // 渐进式间隔：前1分钟每2秒，之后每5秒
+              applyStatus(data);
+              if (data.status !== 'confirmed' && data.status !== 'error') {
                 const interval = pollCount <= 30 ? 2000 : 5000;
                 checkTimer = setTimeout(poll, interval);
               }
             })
             .catch(() => {
-              // 出错时继续轮询
               const interval = pollCount <= 30 ? 2000 : 5000;
               checkTimer = setTimeout(poll, interval);
             });
@@ -1064,7 +1191,6 @@ function renderMainPage(origin) {
         setTimeout(() => t.classList.remove('show'), 3000);
       }
 
-      // 更新再次通知按钮冷却倒计时
       function updateRetryCountdown() {
         const retryBtn = document.getElementById('retryBtn');
         if (!retryBtn) return;
@@ -1082,7 +1208,7 @@ function renderMainPage(origin) {
 
       function startRetryTimer() {
         if (retryTimer) clearInterval(retryTimer);
-        retryCountdown = 30; // 30秒冷却
+        retryCountdown = 30;
         updateRetryCountdown();
         retryTimer = setInterval(updateRetryCountdown, 1000);
       }
@@ -1103,13 +1229,15 @@ function renderMainPage(origin) {
           const res = await fetch('/api/notify', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ message: '再次通知：请尽快挪车', location: userLocation })
+            body: JSON.stringify({
+              message: '再次通知：请尽快挪车',
+              location: userLocation,
+              sessionId: sessionId
+            })
           });
 
           if (res.ok) {
-            // 重置电话按钮倒计时
             startPhoneTimer();
-            // 启动再次通知冷却倒计时
             startRetryTimer();
             if (userLocation) {
               showToast('✅ 再次通知已发送（含位置）');
