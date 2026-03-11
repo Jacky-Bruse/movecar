@@ -5,7 +5,8 @@ addEventListener('fetch', event => {
 const CONFIG = {
   KV_TTL: 3600,
   SESSION_TTL: 1800,
-  RATE_LIMIT_TTL: 30
+  RATE_LIMIT_WINDOW_MS: 30000,
+  RATE_LIMIT_TTL: 60
 }
 
 async function readStatusRecord() {
@@ -252,8 +253,10 @@ async function sendTelegram(content, confirmUrl) {
 async function handleNotify(request, url) {
   const rateLimitMessage = '发送过于频繁，请30秒后再试';
   try {
-    const isLocked = await MOVE_CAR_STATUS.get('notify_lock');
-    if (isLocked) {
+    const existingLock = await MOVE_CAR_STATUS.get('notify_lock');
+    const now = Date.now();
+    const lockedAt = existingLock ? Number(existingLock) : null;
+    if (Number.isFinite(lockedAt) && now - lockedAt < CONFIG.RATE_LIMIT_WINDOW_MS) {
       return new Response(JSON.stringify({ success: false, error: rateLimitMessage }), {
         status: 429,
         headers: { 'Content-Type': 'application/json' }
@@ -285,7 +288,7 @@ async function handleNotify(request, url) {
 
     await MOVE_CAR_STATUS.delete('notify_error').catch(() => {});
     await writeStatusRecord('waiting', sessionId);
-    await MOVE_CAR_STATUS.put('notify_lock', '1', { expirationTtl: CONFIG.RATE_LIMIT_TTL });
+    await MOVE_CAR_STATUS.put('notify_lock', String(now), { expirationTtl: CONFIG.RATE_LIMIT_TTL });
 
     // 根据配置的渠道发送通知
     const channel = typeof NOTIFY_CHANNEL !== 'undefined' ? NOTIFY_CHANNEL : 'bark';

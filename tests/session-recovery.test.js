@@ -5,15 +5,25 @@ const path = require('node:path');
 const vm = require('node:vm');
 
 class FakeKV {
-  constructor() {
+  constructor(options = {}) {
     this.store = new Map();
+    this.minExpirationTtl = options.minExpirationTtl ?? 0;
   }
 
   async get(key) {
     return this.store.has(key) ? this.store.get(key) : null;
   }
 
-  async put(key, value) {
+  async put(key, value, options = {}) {
+    if (
+      options.expirationTtl != null &&
+      this.minExpirationTtl > 0 &&
+      options.expirationTtl < this.minExpirationTtl
+    ) {
+      throw new Error(
+        `KV PUT failed: 400 Invalid expiration_ttl of ${options.expirationTtl}. Expiration TTL must be at least ${this.minExpirationTtl}.`
+      );
+    }
     this.store.set(key, value);
   }
 
@@ -146,6 +156,65 @@ test('notify rejects repeated requests during the server cooldown window', async
   const secondData = await secondResponse.json();
   assert.equal(secondData.success, false);
   assert.match(secondData.error, /30秒/);
+});
+
+test('notify uses Cloudflare-compatible KV ttl for cooldown storage', async () => {
+  const worker = loadWorker({
+    BARK_URL: 'https://example.com/bark',
+    MOVE_CAR_STATUS: new FakeKV({ minExpirationTtl: 60 }),
+  });
+
+  const response = await worker.handleRequest(
+    new Request('https://example.com/api/notify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: '第一次通知',
+        sessionId: 'session-a',
+      }),
+    })
+  );
+
+  assert.equal(response.status, 200);
+});
+
+test('server cooldown expires after 30 seconds even if KV key still exists', async () => {
+  let fakeNow = 1_700_000_000_000;
+  const worker = loadWorker({
+    BARK_URL: 'https://example.com/bark',
+    Date: class extends Date {
+      static now() {
+        return fakeNow;
+      }
+    },
+  });
+
+  const firstResponse = await worker.handleRequest(
+    new Request('https://example.com/api/notify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: '第一次通知',
+        sessionId: 'session-a',
+      }),
+    })
+  );
+  assert.equal(firstResponse.status, 200);
+
+  fakeNow += 31_000;
+
+  const secondResponse = await worker.handleRequest(
+    new Request('https://example.com/api/notify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: '31秒后的通知',
+        sessionId: 'session-a',
+      }),
+    })
+  );
+
+  assert.equal(secondResponse.status, 200);
 });
 
 test('main page bootstraps browser-local session recovery', () => {
