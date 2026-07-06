@@ -404,8 +404,8 @@ test('telegram push sends rich message with inline buttons and location pin', as
 
   const keyboard = messageCall.body.reply_markup.inline_keyboard;
   assert.equal(keyboard.length, 2);
-  assert.match(keyboard[0][0].url, /owner-confirm\?t=/);
-  assert.match(keyboard[1][0].url, /uri\.amap\.com/);
+  assert.match(keyboard[0][0].url, /uri\.amap\.com/);
+  assert.match(keyboard[1][0].url, /owner-confirm\?t=/);
 });
 
 test('main page bootstraps browser-local session recovery', () => {

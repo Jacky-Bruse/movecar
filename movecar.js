@@ -283,7 +283,7 @@ async function sendTelegram(confirmUrl, details) {
   text += (details.location ? '📍 对方已分享位置' : '⚠️ 对方未提供位置') + '\n';
   text += '🕐 ' + escapeMarkdownV2(timeStr) + '（北京时间）';
 
-  const keyboard = [[{ text: '✅ 确认挪车', url: jumpUrl }]];
+  const keyboard = [];
   if (details.location) {
     keyboard.push([
       { text: '🗺️ 高德地图', url: details.location.amapUrl },
@@ -301,6 +301,7 @@ async function sendTelegram(confirmUrl, details) {
       })
     }).catch(() => {});
   }
+  keyboard.push([{ text: '✅ 确认挪车', url: jumpUrl }]);
 
   const response = await fetch(`${apiBase}/sendMessage`, {
     method: 'POST',
