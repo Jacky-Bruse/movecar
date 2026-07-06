@@ -292,6 +292,122 @@ test('notify clears stale locations from the previous request', async () => {
   assert.equal(await kv.get('owner_location'), null);
 });
 
+test('owner eta response and distance surface in check-status', async () => {
+  const worker = loadWorker({ BARK_URL: 'https://example.com/bark' });
+
+  await worker.handleRequest(
+    new Request('https://example.com/api/notify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: '麻烦挪车',
+        sessionId: 'session-a',
+        location: { lat: 31.2, lng: 121.5 },
+      }),
+    })
+  );
+
+  const ownerToken = await worker.MOVE_CAR_STATUS.get('owner_token');
+
+  await worker.handleRequest(
+    new Request('https://example.com/api/owner-confirm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        location: { lat: 31.21, lng: 121.5 },
+        token: ownerToken,
+        response: '5',
+      }),
+    })
+  );
+
+  const statusResponse = await worker.handleRequest(
+    new Request('https://example.com/api/check-status?s=session-a')
+  );
+  const data = await statusResponse.json();
+
+  assert.equal(data.status, 'confirmed');
+  assert.equal(data.response, '5');
+  // 纬度差 0.01° ≈ 1112 米
+  assert.ok(data.distanceMeters > 1000 && data.distanceMeters < 1300);
+});
+
+test('invalid owner response values are stored as null', async () => {
+  const worker = loadWorker({ BARK_URL: 'https://example.com/bark' });
+
+  await worker.handleRequest(
+    new Request('https://example.com/api/notify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: '挪车', sessionId: 'session-a' }),
+    })
+  );
+
+  const ownerToken = await worker.MOVE_CAR_STATUS.get('owner_token');
+
+  await worker.handleRequest(
+    new Request('https://example.com/api/owner-confirm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ location: null, token: ownerToken, response: '<script>' }),
+    })
+  );
+
+  const statusResponse = await worker.handleRequest(
+    new Request('https://example.com/api/check-status?s=session-a')
+  );
+  const data = await statusResponse.json();
+
+  assert.equal(data.status, 'confirmed');
+  assert.equal(data.response, null);
+  assert.equal(data.distanceMeters, null);
+});
+
+test('telegram push sends rich message with inline buttons and location pin', async () => {
+  const calls = [];
+  const worker = loadWorker({
+    NOTIFY_CHANNEL: 'telegram',
+    TELEGRAM_BOT_TOKEN: 'test-token',
+    TELEGRAM_CHAT_ID: '123456',
+    fetch: async (url, options) => {
+      calls.push({
+        url: String(url),
+        body: options && options.body ? JSON.parse(options.body) : null,
+      });
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    },
+  });
+
+  const response = await worker.handleRequest(
+    new Request('https://example.com/api/notify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: '挡住出口了',
+        sessionId: 'session-a',
+        location: { lat: 31.2, lng: 121.5 },
+      }),
+    })
+  );
+  assert.equal(response.status, 200);
+
+  const locationCall = calls.find(c => c.url.includes('/sendLocation'));
+  assert.ok(locationCall, 'should send a native location pin');
+  assert.equal(locationCall.body.latitude, 31.2);
+  assert.equal(locationCall.body.longitude, 121.5);
+
+  const messageCall = calls.find(c => c.url.includes('/sendMessage'));
+  assert.ok(messageCall, 'should send the main message');
+  assert.equal(messageCall.body.parse_mode, 'MarkdownV2');
+  assert.equal(messageCall.body.disable_web_page_preview, true);
+  assert.match(messageCall.body.text, />挡住出口了/);
+
+  const keyboard = messageCall.body.reply_markup.inline_keyboard;
+  assert.equal(keyboard.length, 2);
+  assert.match(keyboard[0][0].url, /owner-confirm\?t=/);
+  assert.match(keyboard[1][0].url, /uri\.amap\.com/);
+});
+
 test('main page bootstraps browser-local session recovery', () => {
   const worker = loadWorker();
 

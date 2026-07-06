@@ -27,14 +27,25 @@ async function readStatusRecord() {
   };
 }
 
-async function writeStatusRecord(status, sessionId) {
+async function writeStatusRecord(status, sessionId, response) {
   await MOVE_CAR_STATUS.put('notify_status', JSON.stringify({
     status,
     sessionId: sessionId || null,
+    response: response || null,
     updatedAt: Date.now()
   }), {
     expirationTtl: CONFIG.SESSION_TTL
   });
+}
+
+// 计算两点间直线距离（米），双方都分享位置时展示给请求者
+function haversineMeters(a, b) {
+  const toRad = d => d * Math.PI / 180;
+  const dLat = toRad(b.lat - a.lat);
+  const dLng = toRad(b.lng - a.lng);
+  const s = Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) ** 2;
+  return Math.round(2 * 6371000 * Math.asin(Math.sqrt(s)));
 }
 
 // 校验车主 token：只有通过推送链接进入的车主才能访问车主端接口
@@ -77,9 +88,10 @@ async function handleRequest(request) {
       });
     }
 
-    const [ownerLocation, error] = await Promise.all([
+    const [ownerLocation, error, requesterLocation] = await Promise.all([
       MOVE_CAR_STATUS.get('owner_location'),
-      MOVE_CAR_STATUS.get('notify_error')
+      MOVE_CAR_STATUS.get('notify_error'),
+      MOVE_CAR_STATUS.get('requester_location')
     ]);
 
     let parsedOwnerLocation = null;
@@ -91,10 +103,20 @@ async function handleRequest(request) {
       }
     }
 
+    let distanceMeters = null;
+    if (parsedOwnerLocation && parsedOwnerLocation.lat && requesterLocation) {
+      try {
+        const requester = JSON.parse(requesterLocation);
+        if (requester.lat) distanceMeters = haversineMeters(requester, parsedOwnerLocation);
+      } catch (e) {}
+    }
+
     return new Response(JSON.stringify({
       status: statusRecord.status || 'waiting',
       ownerLocation: parsedOwnerLocation,
-      error: error || null
+      error: error || null,
+      response: statusRecord.response || null,
+      distanceMeters
     }), {
       headers: {
         'Content-Type': 'application/json',
@@ -163,7 +185,7 @@ function generateMapUrls(lat, lng) {
 }
 
 // 多渠道推送通知（支持逗号分隔配置多个渠道）
-async function sendNotification(channelConfig, content, confirmUrl) {
+async function sendNotification(channelConfig, content, confirmUrl, details) {
   const channels = channelConfig.split(',').map(c => c.trim().toLowerCase()).filter(c => c);
 
   if (channels.length === 0) {
@@ -182,12 +204,12 @@ async function sendNotification(channelConfig, content, confirmUrl) {
           if (typeof TELEGRAM_BOT_TOKEN === 'undefined' || typeof TELEGRAM_CHAT_ID === 'undefined') {
             return Promise.reject(new Error('Telegram 未配置: 请设置 TELEGRAM_BOT_TOKEN 和 TELEGRAM_CHAT_ID'));
           }
-          return sendTelegram(content, confirmUrl);
+          return sendTelegram(confirmUrl, details);
         case 'bark':
           if (typeof BARK_URL === 'undefined') {
             return Promise.reject(new Error('Bark 未配置: 请设置 BARK_URL'));
           }
-          return sendBark(content, confirmUrl);
+          return sendBark(confirmUrl, details);
         default:
           return Promise.reject(new Error(`未知渠道: ${channel}`));
       }
@@ -204,10 +226,12 @@ async function sendNotification(channelConfig, content, confirmUrl) {
   return results;
 }
 
-// Bark 推送 (iOS)
-async function sendBark(content, confirmUrl) {
-  const message = content.replace(/\\n/g, '\n');
-  const barkApiUrl = `${BARK_URL}/挪车请求/${encodeURIComponent(message)}?group=MoveCar&level=critical&call=1&sound=minuet&icon=https://cdn-icons-png.flaticon.com/512/741/741407.png&url=${confirmUrl}`;
+// Bark 推送 (iOS)：标题 / 副标题（留言）/ 正文分层显示
+async function sendBark(confirmUrl, details) {
+  const title = encodeURIComponent('🚗 挪车请求');
+  const subtitle = details.message ? '/' + encodeURIComponent('💬 ' + details.message) : '';
+  const body = encodeURIComponent(details.location ? '📍 已附带位置信息，点击查看' : '⚠️ 未提供位置信息');
+  const barkApiUrl = `${BARK_URL}/${title}${subtitle}/${body}?group=MoveCar&level=critical&call=1&sound=minuet&icon=https://cdn-icons-png.flaticon.com/512/741/741407.png&url=${confirmUrl}`;
   const response = await fetch(barkApiUrl);
   if (!response.ok) throw new Error('Bark API Error');
   return response;
@@ -236,29 +260,57 @@ async function sendWxPusher(content, confirmUrl) {
   return result;
 }
 
-// Telegram Bot 推送
-async function sendTelegram(content, confirmUrl) {
+// Telegram Bot 推送：富文本排版 + 内联按钮 + 原生位置图钉
+async function sendTelegram(confirmUrl, details) {
   // 转义 MarkdownV2 特殊字符，避免用户留言导致解析错误
   const escapeMarkdownV2 = (text) => {
     return text.replace(/([_*\[\]()~`>#+=|{}.!\\-])/g, '\\$1');
   };
 
-  const escapeMarkdownV2Url = (url) => {
-    return url.replace(/([\\)])/g, '\\$1');
-  };
+  const jumpUrl = decodeURIComponent(confirmUrl);
+  const apiBase = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 
-  const escapedContent = escapeMarkdownV2(content.replace(/\\n/g, '\n'));
-  const jumpUrl = escapeMarkdownV2Url(decodeURIComponent(confirmUrl));
-  const message = `${escapedContent}\n\n👉 [点击确认挪车](${jumpUrl})`;
+  // 北京时间（Worker 运行在 UTC）
+  const bj = new Date(Date.now() + 8 * 3600 * 1000);
+  const pad = n => String(n).padStart(2, '0');
+  const timeStr = `${pad(bj.getUTCMonth() + 1)}-${pad(bj.getUTCDate())} ${pad(bj.getUTCHours())}:${pad(bj.getUTCMinutes())}`;
 
-  const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+  let text = '🚗 *挪车请求*\n\n';
+  if (details.message) {
+    const quoted = escapeMarkdownV2(details.message).split('\n').map(line => '>' + line).join('\n');
+    text += '💬 留言：\n' + quoted + '\n\n';
+  }
+  text += (details.location ? '📍 对方已分享位置' : '⚠️ 对方未提供位置') + '\n';
+  text += '🕐 ' + escapeMarkdownV2(timeStr) + '（北京时间）';
+
+  const keyboard = [[{ text: '✅ 确认挪车', url: jumpUrl }]];
+  if (details.location) {
+    keyboard.push([
+      { text: '🗺️ 高德地图', url: details.location.amapUrl },
+      { text: '🍎 苹果地图', url: details.location.appleUrl }
+    ]);
+
+    // 先发原生位置图钉（Telegram 地图用 WGS-84 原始坐标），失败不影响主消息
+    await fetch(`${apiBase}/sendLocation`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        latitude: details.location.lat,
+        longitude: details.location.lng
+      })
+    }).catch(() => {});
+  }
+
+  const response = await fetch(`${apiBase}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       chat_id: TELEGRAM_CHAT_ID,
-      text: message,
+      text,
       parse_mode: 'MarkdownV2',
-      disable_web_page_preview: false
+      disable_web_page_preview: true,
+      reply_markup: { inline_keyboard: keyboard }
     })
   });
 
@@ -298,15 +350,18 @@ async function handleNotify(request, url) {
     // 清理上一轮请求的旧位置，避免车主/请求者看到过期数据
     await MOVE_CAR_STATUS.delete('owner_location').catch(() => {});
 
+    let locationDetails = null;
     if (location && location.lat && location.lng) {
-      const urls = generateMapUrls(location.lat, location.lng);
-      notifyBody += '\\n📍 已附带位置信息，点击查看';
-
-      await MOVE_CAR_STATUS.put('requester_location', JSON.stringify({
+      locationDetails = {
         lat: location.lat,
         lng: location.lng,
-        ...urls
-      }), { expirationTtl: CONFIG.KV_TTL });
+        ...generateMapUrls(location.lat, location.lng)
+      };
+      notifyBody += '\\n📍 已附带位置信息，点击查看';
+
+      await MOVE_CAR_STATUS.put('requester_location', JSON.stringify(locationDetails), {
+        expirationTtl: CONFIG.KV_TTL
+      });
     } else {
       notifyBody += '\\n⚠️ 未提供位置信息';
       await MOVE_CAR_STATUS.delete('requester_location').catch(() => {});
@@ -318,7 +373,7 @@ async function handleNotify(request, url) {
 
     // 根据配置的渠道发送通知
     const channel = typeof NOTIFY_CHANNEL !== 'undefined' ? NOTIFY_CHANNEL : 'bark';
-    await sendNotification(channel, notifyBody, confirmUrl);
+    await sendNotification(channel, notifyBody, confirmUrl, { message, location: locationDetails });
 
     return new Response(JSON.stringify({ success: true }), {
       headers: { 'Content-Type': 'application/json' }
@@ -374,6 +429,7 @@ async function handleOwnerConfirmAction(request) {
     }
 
     const ownerLocation = body.location || null;
+    const ownerResponse = ['1', '5', '10', 'unavailable'].includes(body.response) ? body.response : null;
     const statusRecord = await readStatusRecord();
 
     if (ownerLocation && ownerLocation.lat && ownerLocation.lng) {
@@ -387,7 +443,7 @@ async function handleOwnerConfirmAction(request) {
     }
 
     await MOVE_CAR_STATUS.delete('notify_error').catch(() => {});
-    await writeStatusRecord('confirmed', statusRecord?.sessionId || null);
+    await writeStatusRecord('confirmed', statusRecord?.sessionId || null, ownerResponse);
     return new Response(JSON.stringify({ success: true }), {
       headers: { 'Content-Type': 'application/json' }
     });
@@ -630,6 +686,13 @@ function renderMainPage(origin) {
       .success-card p {
         color: #1e7e34;
         font-size: clamp(14px, 3.5vw, 16px);
+      }
+      .send-summary {
+        color: #2f855a !important;
+        font-size: clamp(12px, 3.2vw, 14px) !important;
+        margin-top: 10px;
+        opacity: 0.85;
+        word-break: break-all;
       }
 
       .owner-card {
@@ -913,12 +976,13 @@ function renderMainPage(origin) {
         <span class="success-icon">✅</span>
         <h2>通知已发送！</h2>
         <p id="waitingText" class="loading-text">正在等待车主回应...</p>
+        <p id="sendSummary" class="send-summary"></p>
       </div>
 
       <div id="ownerFeedback" class="card owner-card hidden">
-        <span style="font-size:56px; display:block; margin-bottom:16px">🎉</span>
-        <h3>车主已收到通知</h3>
-        <p>正在赶来，点击查看车主位置</p>
+        <span id="ownerFbIcon" style="font-size:56px; display:block; margin-bottom:16px">🎉</span>
+        <h3 id="ownerFbTitle">车主已收到通知</h3>
+        <p id="ownerFbDesc">正在赶来，点击查看车主位置</p>
         <div id="ownerMapLinks" class="map-links" style="display:none">
           <a id="ownerAmapLink" href="#" class="map-btn amap">🗺️ 高德地图</a>
           <a id="ownerAppleLink" href="#" class="map-btn apple">🍎 Apple Maps</a>
@@ -1040,6 +1104,33 @@ function renderMainPage(origin) {
         }
       }
 
+      function unlockPhone() {
+        stopPhoneTimer();
+        const phoneBtn = document.getElementById('phoneBtn');
+        const phoneBtnText = document.getElementById('phoneBtnText');
+        if (phoneBtn && phoneBtnText) {
+          phoneBtn.classList.remove('disabled');
+          phoneBtnText.innerText = '直接打电话';
+        }
+      }
+
+      function formatDistance(meters) {
+        return meters < 1000
+          ? '约' + meters + '米'
+          : '约' + (meters / 1000).toFixed(1) + '公里';
+      }
+
+      function updateSendSummary(msg) {
+        const el = document.getElementById('sendSummary');
+        if (!el) return;
+        const now = new Date();
+        const pad = n => String(n).padStart(2, '0');
+        let summary = pad(now.getHours()) + ':' + pad(now.getMinutes()) + ' 已发送';
+        if (msg) summary += ' · 留言「' + msg + '」';
+        summary += userLocation ? ' · 含位置' : ' · 未含位置';
+        el.innerText = summary;
+      }
+
       function showModal(id) {
         document.getElementById(id).classList.add('show');
       }
@@ -1053,8 +1144,28 @@ function renderMainPage(origin) {
           const fb = document.getElementById('ownerFeedback');
           fb.classList.remove('hidden');
 
-          hideActionCard();
-          stopWaiting('车主已确认！');
+          const icon = document.getElementById('ownerFbIcon');
+          const title = document.getElementById('ownerFbTitle');
+          const desc = document.getElementById('ownerFbDesc');
+          const etaText = { '1': '预计 1 分钟内到达', '5': '预计 5 分钟后到达', '10': '预计 10 分钟后到达' };
+
+          if (data.response === 'unavailable') {
+            icon.innerText = '📞';
+            title.innerText = '车主暂时无法前来';
+            desc.innerText = '请直接拨打电话联系';
+            stopWaiting('车主回应：暂时无法前来');
+            unlockPhone();
+          } else {
+            hideActionCard();
+            icon.innerText = '🎉';
+            title.innerText = etaText[data.response] ? '车主正在赶来' : '车主已收到通知';
+            let descText = etaText[data.response] || '正在赶来，点击查看车主位置';
+            if (data.distanceMeters != null) {
+              descText += '，当前距离' + formatDistance(data.distanceMeters);
+            }
+            desc.innerText = descText;
+            stopWaiting('车主已确认！');
+          }
 
           if (data.ownerLocation && data.ownerLocation.amapUrl) {
             document.getElementById('ownerMapLinks').style.display = 'flex';
@@ -1176,6 +1287,7 @@ function renderMainPage(origin) {
           showToast('✅ 发送成功！');
           showSuccessView();
           resetWaitingState();
+          updateSendSummary(msg);
           startPolling();
           startRetryTimer();
         } catch (e) {
@@ -1281,6 +1393,7 @@ function renderMainPage(origin) {
 
           startPhoneTimer();
           startRetryTimer();
+          updateSendSummary('再次通知：请尽快挪车');
           if (userLocation) {
             showToast('✅ 再次通知已发送（含位置）');
           } else {
@@ -1438,6 +1551,29 @@ function renderOwnerPage() {
         cursor: not-allowed;
       }
 
+      .eta-label {
+        font-size: clamp(13px, 3.5vw, 15px);
+        color: #718096;
+        font-weight: 600;
+        margin-bottom: clamp(10px, 2.5vw, 14px);
+      }
+      .eta-group {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: clamp(8px, 2vw, 12px);
+        margin-bottom: clamp(10px, 2.5vw, 14px);
+      }
+      .eta-group .btn {
+        padding: clamp(12px, 3vw, 16px) 4px;
+        font-size: clamp(14px, 3.8vw, 16px);
+        min-height: 52px;
+      }
+      .btn-amber {
+        background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+        box-shadow: 0 8px 24px rgba(245, 158, 11, 0.3);
+        font-size: clamp(14px, 3.8vw, 16px);
+      }
+
       .done-msg {
         background: linear-gradient(135deg, #d1fae5 0%, #a7f3d0 100%);
         border-radius: clamp(14px, 3.5vw, 18px);
@@ -1495,7 +1631,7 @@ function renderOwnerPage() {
     <div class="card">
       <span class="emoji">👋</span>
       <h1>收到挪车请求</h1>
-      <p class="subtitle">对方正在等待，请尽快确认</p>
+      <p class="subtitle">对方正在等待，请选择回应</p>
 
       <div id="mapArea" class="map-section">
         <p>📍 对方位置</p>
@@ -1505,10 +1641,13 @@ function renderOwnerPage() {
         </div>
       </div>
 
-      <button id="confirmBtn" class="btn" onclick="confirmMove()">
-        <span>🚀</span>
-        <span>我已知晓，正在前往</span>
-      </button>
+      <p class="eta-label">🚀 预计多久能到？</p>
+      <div class="eta-group">
+        <button class="btn confirm-btn" onclick="confirmMove('1')">1分钟内</button>
+        <button class="btn confirm-btn" onclick="confirmMove('5')">5分钟</button>
+        <button class="btn confirm-btn" onclick="confirmMove('10')">10分钟</button>
+      </div>
+      <button class="btn btn-amber confirm-btn" onclick="confirmMove('unavailable')">📞 无法前来，请电话联系</button>
 
       <div id="statusMsg" class="loc-status"></div>
 
@@ -1535,30 +1674,32 @@ function renderOwnerPage() {
         } catch(e) {}
       }
 
-      // 点击确认按钮时，触发浏览器授权
-      async function confirmMove() {
-        const btn = document.getElementById('confirmBtn');
-        btn.disabled = true;
-        btn.innerHTML = '<span>📍</span><span>获取位置中...</span>';
+      function setButtonsDisabled(disabled) {
+        document.querySelectorAll('.confirm-btn').forEach(btn => { btn.disabled = disabled; });
+      }
 
-        if ('geolocation' in navigator) {
+      // 点击回应按钮时，触发浏览器定位授权（无法前来则跳过定位）
+      async function confirmMove(response) {
+        setButtonsDisabled(true);
+
+        if (response !== 'unavailable' && 'geolocation' in navigator) {
+          updateStatus('📍 正在获取位置...', '');
           navigator.geolocation.getCurrentPosition(
             async (pos) => {
               // 允许 → 发送确认 + 位置
               ownerLocation = { lat: pos.coords.latitude, lng: pos.coords.longitude };
-              await doConfirm();
+              await doConfirm(response);
             },
             async (err) => {
               // 拒绝或失败 → 直接发送确认，不带位置
               ownerLocation = null;
-              await doConfirm();
+              await doConfirm(response);
             },
             { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
           );
         } else {
-          // 浏览器不支持定位 → 直接发送确认
           ownerLocation = null;
-          await doConfirm();
+          await doConfirm(response);
         }
       }
 
@@ -1575,16 +1716,14 @@ function renderOwnerPage() {
         status.className = 'loc-status show' + (type ? ' ' + type : '');
       }
 
-      async function doConfirm() {
-        const btn = document.getElementById('confirmBtn');
-        btn.innerHTML = '<span>⏳</span><span>确认中...</span>';
-        updateStatus('');
+      async function doConfirm(response) {
+        updateStatus('⏳ 确认中...', '');
 
         try {
           const res = await fetch('/api/owner-confirm', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ location: ownerLocation, token: ownerToken })
+            body: JSON.stringify({ location: ownerLocation, token: ownerToken, response: response })
           });
 
           let data = null;
@@ -1602,12 +1741,17 @@ function renderOwnerPage() {
             throw new Error((data && data.error) ? data.error : '确认失败');
           }
 
-          btn.innerHTML = '<span>✅</span><span>已确认</span>';
-          btn.style.background = 'linear-gradient(135deg, #9ca3af 0%, #6b7280 100%)';
+          updateStatus('');
+          const doneText = {
+            '1': '已告知对方您 1 分钟内到达',
+            '5': '已告知对方您约 5 分钟后到达',
+            '10': '已告知对方您约 10 分钟后到达',
+            'unavailable': '已告知对方请直接电话联系'
+          };
+          document.querySelector('#doneMsg p').innerText = '✅ ' + (doneText[response] || '已通知对方您正在赶来！');
           document.getElementById('doneMsg').classList.add('show');
         } catch(e) {
-          btn.disabled = false;
-          btn.innerHTML = '<span>🚀</span><span>我已知晓，正在前往</span>';
+          setButtonsDisabled(false);
           updateStatus('确认失败，请重试：' + ((e && e.message) ? e.message : '未知错误'), 'error');
         }
       }
