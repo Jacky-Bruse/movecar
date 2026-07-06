@@ -50,6 +50,7 @@ function loadWorker(overrides = {}) {
     Promise,
     TextEncoder,
     TextDecoder,
+    crypto: globalThis.crypto,
     MOVE_CAR_STATUS: new FakeKV(),
     addEventListener: () => {},
     ...overrides,
@@ -102,12 +103,15 @@ test('owner confirmation remains recoverable for the originating browser session
     })
   );
 
+  const ownerToken = await worker.MOVE_CAR_STATUS.get('owner_token');
+
   await worker.handleRequest(
     new Request('https://example.com/api/owner-confirm', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         location: { lat: 31.2, lng: 121.5 },
+        token: ownerToken,
       }),
     })
   );
@@ -215,6 +219,77 @@ test('server cooldown expires after 30 seconds even if KV key still exists', asy
   );
 
   assert.equal(secondResponse.status, 200);
+});
+
+test('owner endpoints reject requests without a valid token', async () => {
+  const worker = loadWorker({ BARK_URL: 'https://example.com/bark' });
+
+  await worker.handleRequest(
+    new Request('https://example.com/api/notify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: '麻烦挪车',
+        sessionId: 'session-a',
+        location: { lat: 31.2, lng: 121.5 },
+      }),
+    })
+  );
+
+  const pageResponse = await worker.handleRequest(
+    new Request('https://example.com/owner-confirm')
+  );
+  assert.equal(pageResponse.status, 403);
+
+  const locationResponse = await worker.handleRequest(
+    new Request('https://example.com/api/get-location?t=wrong-token')
+  );
+  assert.equal(locationResponse.status, 403);
+
+  const confirmResponse = await worker.handleRequest(
+    new Request('https://example.com/api/owner-confirm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ location: null, token: 'wrong-token' }),
+    })
+  );
+  assert.equal(confirmResponse.status, 403);
+
+  const ownerToken = await worker.MOVE_CAR_STATUS.get('owner_token');
+  assert.ok(ownerToken);
+
+  const validPageResponse = await worker.handleRequest(
+    new Request(`https://example.com/owner-confirm?t=${ownerToken}`)
+  );
+  assert.equal(validPageResponse.status, 200);
+
+  const validLocationResponse = await worker.handleRequest(
+    new Request(`https://example.com/api/get-location?t=${ownerToken}`)
+  );
+  assert.equal(validLocationResponse.status, 200);
+});
+
+test('notify clears stale locations from the previous request', async () => {
+  const worker = loadWorker({ BARK_URL: 'https://example.com/bark' });
+  const kv = worker.MOVE_CAR_STATUS;
+
+  await kv.put('requester_location', JSON.stringify({ lat: 1, lng: 1 }));
+  await kv.put('owner_location', JSON.stringify({ lat: 2, lng: 2 }));
+
+  const response = await worker.handleRequest(
+    new Request('https://example.com/api/notify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: '无位置通知',
+        sessionId: 'session-a',
+      }),
+    })
+  );
+  assert.equal(response.status, 200);
+
+  assert.equal(await kv.get('requester_location'), null);
+  assert.equal(await kv.get('owner_location'), null);
 });
 
 test('main page bootstraps browser-local session recovery', () => {
