@@ -290,16 +290,21 @@ async function sendTelegram(confirmUrl, details) {
       { text: '🍎 苹果地图', url: details.location.appleUrl }
     ]);
 
-    // 先发原生位置图钉（Telegram 地图用 WGS-84 原始坐标），失败不影响主消息
-    await fetch(`${apiBase}/sendLocation`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: TELEGRAM_CHAT_ID,
-        latitude: details.location.lat,
-        longitude: details.location.lng
-      })
-    }).catch(() => {});
+    // 用高德静态地图图片作为预览（GCJ-02 坐标，不漂移），失败不影响主消息
+    // 需配置 AMAP_KEY；未配置则跳过预览，仅保留上方地图按钮
+    if (typeof AMAP_KEY !== 'undefined' && AMAP_KEY) {
+      const gcj = wgs84ToGcj02(details.location.lat, details.location.lng);
+      const staticMapUrl = `https://restapi.amap.com/v3/staticmap?location=${gcj.lng},${gcj.lat}&zoom=16&size=750*350&scale=2&markers=mid,0xFF0000,:${gcj.lng},${gcj.lat}&key=${AMAP_KEY}`;
+      await fetch(`${apiBase}/sendPhoto`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: TELEGRAM_CHAT_ID,
+          photo: staticMapUrl,
+          caption: '📍 对方位置'
+        })
+      }).catch(() => {});
+    }
   }
   keyboard.push([{ text: '✅ 确认挪车', url: jumpUrl }]);
 

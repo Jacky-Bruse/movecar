@@ -369,6 +369,7 @@ test('telegram push sends rich message with inline buttons and location pin', as
     NOTIFY_CHANNEL: 'telegram',
     TELEGRAM_BOT_TOKEN: 'test-token',
     TELEGRAM_CHAT_ID: '123456',
+    AMAP_KEY: 'test-amap-key',
     fetch: async (url, options) => {
       calls.push({
         url: String(url),
@@ -391,10 +392,12 @@ test('telegram push sends rich message with inline buttons and location pin', as
   );
   assert.equal(response.status, 200);
 
-  const locationCall = calls.find(c => c.url.includes('/sendLocation'));
-  assert.ok(locationCall, 'should send a native location pin');
-  assert.equal(locationCall.body.latitude, 31.2);
-  assert.equal(locationCall.body.longitude, 121.5);
+  const photoCall = calls.find(c => c.url.includes('/sendPhoto'));
+  assert.ok(photoCall, 'should send an amap static map preview');
+  assert.match(photoCall.body.photo, /restapi\.amap\.com\/v3\/staticmap/);
+  assert.match(photoCall.body.photo, /key=test-amap-key/);
+  // 预览用 GCJ-02 坐标（已偏移），不等于原始 WGS-84 经度
+  assert.doesNotMatch(photoCall.body.photo, /location=121\.5,/);
 
   const messageCall = calls.find(c => c.url.includes('/sendMessage'));
   assert.ok(messageCall, 'should send the main message');

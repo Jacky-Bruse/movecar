@@ -133,10 +133,23 @@
 |--------|------|--------|
 | `TELEGRAM_BOT_TOKEN` | Bot Token | `123456:ABC-xxxxx` |
 | `TELEGRAM_CHAT_ID` | 你的 Chat ID | `123456789` |
+| `AMAP_KEY` | 高德地图预览 Key（可选） | `xxxxx` |
+
+> 💡 配置 `AMAP_KEY` 后，Telegram 消息会附带一张**准确的高德地图预览图**（GCJ-02 坐标，无漂移）；不配置则仅显示地图按钮，不影响使用。
 
 ---
 
 ### 推送渠道配置教程
+
+#### 高德地图预览 Key（可选，用于 Telegram 地图预览）
+
+1. 访问 [高德开放平台](https://console.amap.com/dev/key/app)，注册并登录
+2. 「应用管理」→「创建新应用」，随意填写应用名
+3. 在应用下「添加 Key」，服务平台选择 **「Web 服务」**
+4. 创建后复制生成的 Key，填入 `AMAP_KEY`
+
+> ⚠️ 必须选「Web 服务」类型的 Key，其他类型无法调用静态地图接口。免费额度足够个人使用。
+
 
 #### Bark（iOS）
 
