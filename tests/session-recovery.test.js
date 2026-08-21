@@ -435,3 +435,75 @@ test('main page clears stale browser session when status is gone', () => {
     assert.match(html, /localStorage\.removeItem\(SESSION_STORAGE_KEY\)/);
   });
 });
+
+test('phone number is only released after two notifies without owner response', async () => {
+  let fakeNow = 1_700_000_000_000;
+  const worker = loadWorker({
+    BARK_URL: 'https://example.com/bark',
+    PHONE_NUMBER: '13800138000',
+    Date: class extends Date {
+      static now() {
+        return fakeNow;
+      }
+    },
+  });
+
+  const notify = () => worker.handleRequest(
+    new Request('https://example.com/api/notify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: '请挪车', sessionId: 'session-a' }),
+    })
+  );
+  const checkStatus = (s) => worker.handleRequest(
+    new Request('https://example.com/api/check-status?s=' + s)
+  ).then(res => res.json());
+
+  await notify();
+  assert.equal((await checkStatus('session-a')).phone, null);
+
+  fakeNow += 31_000;
+  await notify();
+  assert.equal((await checkStatus('session-a')).phone, '13800138000');
+
+  const otherSession = await checkStatus('session-b');
+  assert.equal(otherSession.phone, undefined);
+});
+
+test('owner unavailable response releases phone regardless of notify count', async () => {
+  const worker = loadWorker({
+    BARK_URL: 'https://example.com/bark',
+    PHONE_NUMBER: '13800138000',
+  });
+
+  await worker.handleRequest(
+    new Request('https://example.com/api/notify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: '请挪车', sessionId: 'session-a' }),
+    })
+  );
+
+  const ownerToken = await worker.MOVE_CAR_STATUS.get('owner_token');
+  await worker.handleRequest(
+    new Request('https://example.com/api/owner-confirm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: ownerToken, response: 'unavailable' }),
+    })
+  );
+
+  const data = await worker
+    .handleRequest(new Request('https://example.com/api/check-status?s=session-a'))
+    .then(res => res.json());
+  assert.equal(data.status, 'confirmed');
+  assert.equal(data.phone, '13800138000');
+});
+
+test('main page HTML never embeds the raw phone number', async () => {
+  const worker = loadWorker({ PHONE_NUMBER: '13800138000' });
+  const response = await worker.handleRequest(new Request('https://example.com/'));
+  const html = await response.text();
+  assert.ok(!html.includes('13800138000'));
+  assert.ok(html.includes('phoneBtn'));
+});

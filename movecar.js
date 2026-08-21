@@ -27,11 +27,12 @@ async function readStatusRecord() {
   };
 }
 
-async function writeStatusRecord(status, sessionId, response) {
+async function writeStatusRecord(status, sessionId, response, notifyCount) {
   await MOVE_CAR_STATUS.put('notify_status', JSON.stringify({
     status,
     sessionId: sessionId || null,
     response: response || null,
+    notifyCount: notifyCount || 0,
     updatedAt: Date.now()
   }), {
     expirationTtl: CONFIG.SESSION_TTL
@@ -111,12 +112,21 @@ async function handleRequest(request) {
       } catch (e) {}
     }
 
+    // 电话号码不进页面源码，只在满足条件时对发起会话释放：
+    // 1) 累计通知达 2 次且车主未回应；2) 车主回应「暂时无法前来」
+    const phone = typeof PHONE_NUMBER !== 'undefined' ? PHONE_NUMBER : '';
+    const releasePhone = Boolean(phone) && (
+      (statusRecord.status === 'waiting' && (statusRecord.notifyCount || 0) >= 2) ||
+      (statusRecord.status === 'confirmed' && statusRecord.response === 'unavailable')
+    );
+
     return new Response(JSON.stringify({
       status: statusRecord.status || 'waiting',
       ownerLocation: parsedOwnerLocation,
       error: error || null,
       response: statusRecord.response || null,
-      distanceMeters
+      distanceMeters,
+      phone: releasePhone ? phone : null
     }), {
       headers: {
         'Content-Type': 'application/json',
@@ -374,7 +384,12 @@ async function handleNotify(request, url) {
     }
 
     await MOVE_CAR_STATUS.delete('notify_error').catch(() => {});
-    await writeStatusRecord('waiting', sessionId);
+    // 同一会话累计通知次数，达到阈值后向请求者释放车主电话
+    const existingRecord = await readStatusRecord().catch(() => null);
+    const notifyCount = (existingRecord && existingRecord.sessionId === sessionId && existingRecord.status === 'waiting')
+      ? (existingRecord.notifyCount || 0) + 1
+      : 1;
+    await writeStatusRecord('waiting', sessionId, null, notifyCount);
     await MOVE_CAR_STATUS.put('notify_lock', String(now), { expirationTtl: CONFIG.RATE_LIMIT_TTL });
 
     // 根据配置的渠道发送通知
@@ -388,7 +403,7 @@ async function handleNotify(request, url) {
     const errorMessage = (error && error.message) ? error.message : 'Unknown error';
     const statusRecord = await readStatusRecord().catch(() => null);
     await MOVE_CAR_STATUS.delete('notify_lock').catch(() => {});
-    await writeStatusRecord('error', statusRecord?.sessionId || null).catch(() => {});
+    await writeStatusRecord('error', statusRecord?.sessionId || null, null, statusRecord?.notifyCount).catch(() => {});
     await MOVE_CAR_STATUS.put('notify_error', errorMessage, { expirationTtl: CONFIG.KV_TTL }).catch(() => {});
     return new Response(JSON.stringify({ success: false, error: errorMessage }), {
       status: 500,
@@ -449,7 +464,7 @@ async function handleOwnerConfirmAction(request) {
     }
 
     await MOVE_CAR_STATUS.delete('notify_error').catch(() => {});
-    await writeStatusRecord('confirmed', statusRecord?.sessionId || null, ownerResponse);
+    await writeStatusRecord('confirmed', statusRecord?.sessionId || null, ownerResponse, statusRecord?.notifyCount);
     return new Response(JSON.stringify({ success: true }), {
       headers: { 'Content-Type': 'application/json' }
     });
@@ -466,7 +481,8 @@ async function handleOwnerConfirmAction(request) {
 }
 
 function renderMainPage(origin) {
-  const phone = typeof PHONE_NUMBER !== 'undefined' ? PHONE_NUMBER : '';
+  // 只注入"是否配置了电话"，号码本身经 check-status 按条件下发，避免进页面源码
+  const hasPhone = Boolean(typeof PHONE_NUMBER !== 'undefined' && PHONE_NUMBER);
 
   const html = `
   <!DOCTYPE html>
@@ -1001,9 +1017,9 @@ function renderMainPage(origin) {
           <span>🔔</span>
           <span>再次通知</span>
         </button>
-        ${phone ? `<a id="phoneBtn" href="tel:${phone}" class="btn-phone disabled">
+        ${hasPhone ? `<a id="phoneBtn" class="btn-phone disabled">
           <span>📞</span>
-          <span id="phoneBtnText">3分0秒后可拨打</span>
+          <span id="phoneBtnText">再催促 1 次后可拨打</span>
         </a>` : ''}
       </div>
     </div>
@@ -1011,8 +1027,6 @@ function renderMainPage(origin) {
     <script>
       let userLocation = null;
       let checkTimer = null;
-      let phoneTimer = null;
-      let phoneCountdown = 180;
       let retryCountdown = 0;
       let retryTimer = null;
       const SESSION_STORAGE_KEY = 'movecar_session';
@@ -1043,44 +1057,7 @@ function renderMainPage(origin) {
         document.getElementById('successView').style.display = 'flex';
       }
 
-      function updatePhoneCountdown() {
-        const phoneBtn = document.getElementById('phoneBtn');
-        const phoneBtnText = document.getElementById('phoneBtnText');
-        if (!phoneBtn || !phoneBtnText) return;
-
-        if (phoneCountdown <= 0) {
-          phoneBtn.classList.remove('disabled');
-          phoneBtnText.innerText = '直接打电话';
-          stopPhoneTimer();
-        } else {
-          const minutes = Math.floor(phoneCountdown / 60);
-          const seconds = phoneCountdown % 60;
-          const timeStr = minutes > 0 ? minutes + '分' + seconds + '秒' : seconds + '秒';
-          phoneBtnText.innerText = timeStr + '后可拨打';
-          phoneCountdown--;
-        }
-      }
-
-      function startPhoneTimer() {
-        if (phoneTimer) clearInterval(phoneTimer);
-        const phoneBtn = document.getElementById('phoneBtn');
-        if (!phoneBtn) return;
-        phoneCountdown = 180;
-        phoneBtn.classList.add('disabled');
-        phoneBtn.style.display = '';
-        updatePhoneCountdown();
-        phoneTimer = setInterval(updatePhoneCountdown, 1000);
-      }
-
-      function stopPhoneTimer() {
-        if (phoneTimer) {
-          clearInterval(phoneTimer);
-          phoneTimer = null;
-        }
-      }
-
       function hideActionCard() {
-        stopPhoneTimer();
         const actionCard = document.getElementById('actionCard');
         if (actionCard) {
           actionCard.style.display = 'none';
@@ -1094,6 +1071,14 @@ function renderMainPage(origin) {
         const ownerMapLinks = document.getElementById('ownerMapLinks');
 
         if (actionCard) actionCard.style.display = '';
+        // 新一轮请求重新锁定电话按钮
+        const phoneBtn = document.getElementById('phoneBtn');
+        const phoneBtnText = document.getElementById('phoneBtnText');
+        if (phoneBtn && phoneBtnText) {
+          phoneBtn.removeAttribute('href');
+          phoneBtn.classList.add('disabled');
+          phoneBtnText.innerText = '再催促 1 次后可拨打';
+        }
         if (ownerFeedback) ownerFeedback.classList.add('hidden');
         if (ownerMapLinks) ownerMapLinks.style.display = 'none';
         if (waitingText) {
@@ -1110,11 +1095,12 @@ function renderMainPage(origin) {
         }
       }
 
-      function unlockPhone() {
-        stopPhoneTimer();
+      function unlockPhone(phone) {
+        if (!phone) return;
         const phoneBtn = document.getElementById('phoneBtn');
         const phoneBtnText = document.getElementById('phoneBtnText');
         if (phoneBtn && phoneBtnText) {
+          phoneBtn.href = 'tel:' + phone;
           phoneBtn.classList.remove('disabled');
           phoneBtnText.innerText = '直接打电话';
         }
@@ -1146,6 +1132,8 @@ function renderMainPage(origin) {
       }
 
       function applyStatus(data) {
+        if (data.phone) unlockPhone(data.phone);
+
         if (data.status === 'confirmed') {
           const fb = document.getElementById('ownerFeedback');
           fb.classList.remove('hidden');
@@ -1160,7 +1148,6 @@ function renderMainPage(origin) {
             title.innerText = '车主暂时无法前来';
             desc.innerText = '请直接拨打电话联系';
             stopWaiting('车主回应：暂时无法前来');
-            unlockPhone();
           } else {
             hideActionCard();
             icon.innerText = '🎉';
@@ -1308,8 +1295,6 @@ function renderMainPage(origin) {
         const maxPolls = 180;
         if (checkTimer) clearTimeout(checkTimer);
 
-        startPhoneTimer();
-
         function poll() {
           pollCount++;
           if (pollCount > maxPolls) {
@@ -1397,7 +1382,6 @@ function renderMainPage(origin) {
             throw new Error((data && data.error) || '发送失败，请重试');
           }
 
-          startPhoneTimer();
           startRetryTimer();
           updateSendSummary('再次通知：请尽快挪车');
           if (userLocation) {
