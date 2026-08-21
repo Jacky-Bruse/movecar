@@ -1132,8 +1132,6 @@ function renderMainPage(origin) {
       }
 
       function applyStatus(data) {
-        if (data.phone) unlockPhone(data.phone);
-
         if (data.status === 'confirmed') {
           const fb = document.getElementById('ownerFeedback');
           fb.classList.remove('hidden');
@@ -1148,6 +1146,7 @@ function renderMainPage(origin) {
             title.innerText = '车主暂时无法前来';
             desc.innerText = '请直接拨打电话联系';
             stopWaiting('车主回应：暂时无法前来');
+            unlockPhone(data.phone);
           } else {
             hideActionCard();
             icon.innerText = '🎉';
@@ -1177,6 +1176,8 @@ function renderMainPage(origin) {
         }
 
         resetWaitingState();
+        // 必须在 resetWaitingState 之后解锁，否则会被其中的重新锁定逻辑覆盖
+        if (data.phone) unlockPhone(data.phone);
       }
 
       async function restoreActiveSession() {
