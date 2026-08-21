@@ -460,14 +460,58 @@ test('phone number is only released after two notifies without owner response', 
   ).then(res => res.json());
 
   await notify();
-  assert.equal((await checkStatus('session-a')).phone, null);
+  const afterFirst = await checkStatus('session-a');
+  assert.equal(afterFirst.phone, null);
+  assert.equal(afterFirst.phoneUnlockInSeconds, null);
 
   fakeNow += 31_000;
   await notify();
+
+  // 次数达标但未满 60 秒：只给倒计时，不给号码
+  const beforeDelay = await checkStatus('session-a');
+  assert.equal(beforeDelay.phone, null);
+  assert.ok(beforeDelay.phoneUnlockInSeconds > 0 && beforeDelay.phoneUnlockInSeconds <= 60);
+
+  // 满 60 秒后放号
+  fakeNow += 61_000;
   assert.equal((await checkStatus('session-a')).phone, '13800138000');
 
   const otherSession = await checkStatus('session-b');
   assert.equal(otherSession.phone, undefined);
+});
+
+test('third notify does not restart the phone unlock delay', async () => {
+  let fakeNow = 1_700_000_000_000;
+  const worker = loadWorker({
+    BARK_URL: 'https://example.com/bark',
+    PHONE_NUMBER: '13800138000',
+    Date: class extends Date {
+      static now() {
+        return fakeNow;
+      }
+    },
+  });
+
+  const notify = () => worker.handleRequest(
+    new Request('https://example.com/api/notify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: '请挪车', sessionId: 'session-a' }),
+    })
+  );
+
+  await notify();
+  fakeNow += 31_000;
+  await notify();
+  fakeNow += 31_000;
+  await notify();
+
+  // 第 3 次催促不重置计时：距第 2 次已 31 秒，剩余应 ≤29 秒
+  const data = await worker
+    .handleRequest(new Request('https://example.com/api/check-status?s=session-a'))
+    .then(res => res.json());
+  assert.equal(data.phone, null);
+  assert.ok(data.phoneUnlockInSeconds <= 29);
 });
 
 test('owner unavailable response releases phone regardless of notify count', async () => {
